@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QPI Machine Scheduler</title>
+<style>
+:root {
+  --bg: #0f1117;
+  --surface: #1a1d27;
+  --surface2: #242836;
+  --border: #2e3348;
+  --text: #e2e4e9;
+  --text-dim: #8b8fa3;
+  --accent: #6c7bf7;
+  --accent-dim: #4a56c9;
+  --green: #34d399;
+  --orange: #f59e0b;
+  --red: #ef4444;
+  --blue: #3b82f6;
+  --purple: #a78bfa;
+  --cyan: #22d3ee;
+  --pink: #ec4899;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+/* ── Header ─────────────────────────────────────────── */
+header {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 16px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+header h1 { font-size: 18px; font-weight: 600; white-space: nowrap; }
+header h1 span { color: var(--accent); }
+
+.upload-area {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.upload-area label { font-size: 13px; color: var(--text-dim); }
+.upload-area input[type="file"] { display: none; }
+
+.upload-btn, .run-btn {
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.upload-btn:hover { border-color: var(--accent); }
+.run-btn { background: var(--accent); border-color: var(--accent); font-weight: 600; }
+.run-btn:hover { background: var(--accent-dim); }
+.run-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.file-name {
+  font-size: 12px; color: var(--text-dim);
+  max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.upload-area input[type="date"],
+.upload-area input[type="time"],
+.upload-area input[type="number"] {
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 4px; color: var(--text); padding: 6px 8px; font-size: 12px; width: 130px;
+}
+.upload-area input[type="number"] { width: 60px; }
+
+/* ── Stats Bar ──────────────────────────────────────── */
+.stats-bar {
+  display: flex; gap: 16px; padding: 12px 24px;
+  background: var(--surface); border-bottom: 1px solid var(--border); flex-wrap: wrap;
+}
+
+.stat-card {
+  padding: 8px 14px; background: var(--surface2);
+  border-radius: 6px; border: 1px solid var(--border); min-width: 120px;
+}
+
+.stat-card .label {
+  font-size: 10px; text-transform: uppercase;
+  letter-spacing: 0.05em; color: var(--text-dim); margin-bottom: 2px;
+}
+
+.stat-card .value { font-size: 18px; font-weight: 700; }
+.stat-card .value.green { color: var(--green); }
+.stat-card .value.orange { color: var(--orange); }
+.stat-card .value.blue { color: var(--blue); }
+
+/* ── Tabs ───────────────────────────────────────────── */
+.tabs {
+  display: flex; gap: 0; padding: 0 24px;
+  background: var(--surface); border-bottom: 1px solid var(--border);
+}
+
+.tab {
+  padding: 10px 20px; font-size: 13px; color: var(--text-dim);
+  cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.15s;
+}
+
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+/* ── Content ────────────────────────────────────────── */
+.content { padding: 20px 24px; }
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+/* ── Day Navigation ─────────────────────────────────── */
+.day-nav {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.day-nav-center {
+  display: flex; align-items: center; gap: 12px;
+}
+
+.day-nav h2 { font-size: 16px; font-weight: 600; min-width: 200px; text-align: center; }
+
+.day-btn {
+  padding: 6px 14px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--surface2);
+  color: var(--text); font-size: 13px; cursor: pointer; transition: all 0.15s;
+}
+
+.day-btn:hover { border-color: var(--accent); }
+.day-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+.day-indicator {
+  font-size: 12px; color: var(--text-dim);
+}
+
+/* ── Day Gantt ──────────────────────────────────────── */
+.day-gantt {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.shift-header {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+}
+
+.shift-header .machine-col {
+  width: 64px; min-width: 64px;
+  padding: 8px; font-size: 11px; color: var(--text-dim);
+  background: var(--surface2);
+}
+
+.shift-header .shift-col {
+  flex: 1; text-align: center; padding: 8px;
+  font-size: 12px; font-weight: 600; color: var(--text-dim);
+  border-left: 1px solid var(--border);
+}
+
+/* Time ruler */
+.time-ruler {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+}
+
+.time-ruler .machine-col {
+  width: 64px; min-width: 64px;
+  background: var(--surface2);
+}
+
+.time-ruler .shift-track {
+  flex: 1; display: flex; position: relative;
+  border-left: 1px solid var(--border);
+  height: 20px;
+}
+
+.time-ruler .hour-mark {
+  position: absolute; font-size: 9px; color: var(--text-dim);
+  transform: translateX(-50%); top: 3px;
+}
+
+/* Machine row */
+.machine-row {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  min-height: 44px;
+}
+
+.machine-row:last-child { border-bottom: none; }
+
+.machine-row .machine-col {
+  width: 64px; min-width: 64px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 700; color: var(--text-dim);
+  background: var(--surface2);
+  border-right: 1px solid var(--border);
+}
+
+.machine-row .shift-track {
+  flex: 1; position: relative;
+  border-left: 1px solid var(--border);
+  min-height: 44px;
+}
+
+.machine-row .shift-track:first-of-type { border-left: none; }
+
+/* Hour gridlines */
+.hour-line {
+  position: absolute; top: 0; bottom: 0; width: 1px;
+  background: var(--border); opacity: 0.3; pointer-events: none;
+}
+
+/* Shift divider */
+.shift-divider {
+  position: absolute; top: 0; bottom: 0; width: 2px;
+  background: var(--accent); opacity: 0.3; pointer-events: none; left: 50%;
+}
+
+/* Bars */
+.bar {
+  position: absolute; top: 6px; height: 32px;
+  border-radius: 4px; font-size: 10px;
+  display: flex; align-items: center; padding: 0 5px;
+  overflow: hidden; white-space: nowrap;
+  cursor: pointer; transition: opacity 0.15s;
+  border: 1px solid transparent;
+}
+
+.bar:hover { opacity: 0.85; border-color: rgba(255,255,255,0.6); z-index: 10; }
+
+.bar.job { background: var(--blue); color: white; }
+.bar.changeover { background: var(--orange); color: white; }
+.bar.tool_swap { background: var(--purple); color: white; }
+.bar.not_running { background: var(--surface2); color: var(--text-dim); border: 1px dashed var(--border); }
+
+.bar.prio-0 { background: var(--red); }
+.bar.prio-1 { background: var(--pink); }
+.bar.prio-2 { background: #c47e15; }
+
+.bar .bar-text { overflow: hidden; text-overflow: ellipsis; }
+.bar .bar-tool { font-size: 9px; opacity: 0.75; margin-left: 4px; }
+
+/* Crew arrow overlay */
+.crew-arrow-indicator {
+  position: absolute; top: 0; height: 100%;
+  display: flex; align-items: center;
+  font-size: 10px; color: var(--cyan); font-weight: 700;
+  pointer-events: none; z-index: 5;
+}
+
+/* ── Legend ──────────────────────────────────────────── */
+.legend {
+  display: flex; gap: 16px; flex-wrap: wrap;
+  font-size: 11px; color: var(--text-dim);
+}
+
+.legend-item { display: flex; align-items: center; gap: 4px; }
+
+.legend-swatch { width: 12px; height: 12px; border-radius: 3px; }
+
+/* ── Tooltip ────────────────────────────────────────── */
+.tooltip {
+  display: none; position: fixed; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px; font-size: 12px; z-index: 1000;
+  max-width: 340px; box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+  pointer-events: none;
+}
+
+.tooltip.show { display: block; }
+.tooltip .tt-row { display: flex; justify-content: space-between; gap: 16px; padding: 2px 0; }
+.tooltip .tt-label { color: var(--text-dim); white-space: nowrap; }
+.tooltip .tt-value { font-weight: 600; text-align: right; }
+.tooltip .tt-title {
+  font-weight: 700; font-size: 13px;
+  margin-bottom: 6px; padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* ── Tables ─────────────────────────────────────────── */
+table.data-table {
+  width: 100%; border-collapse: collapse; font-size: 13px;
+}
+
+table.data-table th, table.data-table td {
+  padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border);
+}
+
+table.data-table th {
+  font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.04em; color: var(--text-dim);
+  background: var(--surface); position: sticky; top: 0; z-index: 2;
+}
+
+table.data-table td { font-variant-numeric: tabular-nums; }
+
+.util-bar {
+  display: inline-block; height: 6px; border-radius: 3px;
+  background: var(--accent); vertical-align: middle; margin-right: 6px;
+}
+
+/* ── Crew List ──────────────────────────────────────── */
+.crew-list { display: flex; flex-direction: column; gap: 6px; }
+
+.crew-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 8px 12px; background: var(--surface2);
+  border-radius: 6px; font-size: 13px; border: 1px solid var(--border);
+}
+
+.crew-time { color: var(--text-dim); font-variant-numeric: tabular-nums; min-width: 110px; }
+.crew-arrow { color: var(--accent); font-weight: 700; }
+.crew-hc { color: var(--cyan); font-weight: 600; }
+
+/* ── Loading / Empty ────────────────────────────────── */
+.loading { display: none; text-align: center; padding: 60px; color: var(--text-dim); }
+.loading.show { display: block; }
+
+.spinner {
+  width: 32px; height: 32px;
+  border: 3px solid var(--border); border-top-color: var(--accent);
+  border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 12px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.empty-state { text-align: center; padding: 80px 20px; color: var(--text-dim); }
+.empty-state h2 { font-size: 16px; margin-bottom: 8px; color: var(--text); }
+.empty-state p { font-size: 13px; }
+
+/* ── Day summary ────────────────────────────────────── */
+.day-summary {
+  display: flex; gap: 12px; margin-top: 16px; flex-wrap: wrap;
+}
+
+.day-summary-card {
+  flex: 1; min-width: 140px;
+  padding: 10px 14px; background: var(--surface2);
+  border-radius: 6px; border: 1px solid var(--border);
+}
+
+.day-summary-card .ds-label { font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.04em; }
+.day-summary-card .ds-value { font-size: 15px; font-weight: 700; margin-top: 2px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1><span>QPI</span> Machine Scheduler</h1>
+  <div class="upload-area">
+    <label>Date:</label>
+    <input type="date" id="refDate">
+    <label>Time:</label>
+    <input type="time" id="refTime" value="06:30">
+    <label>Max machines:</label>
+    <input type="number" id="maxConcurrent" value="5" min="1" max="9">
+    <button class="upload-btn" onclick="document.getElementById('fileInput').click()">Choose Excel</button>
+    <input type="file" id="fileInput" accept=".xlsx,.xls">
+    <span class="file-name" id="fileName"></span>
+    <button class="run-btn" id="runBtn" disabled onclick="runSchedule()">Generate Schedule</button>
+  </div>
+</header>
+
+<div class="stats-bar" id="statsBar" style="display:none;">
+  <div class="stat-card"><div class="label">Status</div><div class="value green" id="statStatus">-</div></div>
+  <div class="stat-card"><div class="label">Jobs Scheduled</div><div class="value blue" id="statJobs">-</div></div>
+  <div class="stat-card"><div class="label">Makespan</div><div class="value" id="statMakespan">-</div></div>
+  <div class="stat-card"><div class="label">Crew Movements</div><div class="value orange" id="statCrew">-</div></div>
+  <div class="stat-card"><div class="label">Skipped</div><div class="value" id="statSkipped">-</div></div>
+</div>
+
+<div class="tabs" id="tabsBar" style="display:none;">
+  <div class="tab active" data-tab="gantt">Day View</div>
+  <div class="tab" data-tab="machines">Machines</div>
+  <div class="tab" data-tab="crew">Crew Movements</div>
+  <div class="tab" data-tab="jobs">All Jobs</div>
+</div>
+
+<div class="content">
+  <div class="loading" id="loading"><div class="spinner"></div><div>Generating schedule...</div></div>
+  <div class="empty-state" id="emptyState">
+    <h2>Upload an Excel schedule file to get started</h2>
+    <p>Select a file and click Generate Schedule</p>
+  </div>
+
+  <!-- Day View Tab -->
+  <div class="tab-panel active" id="panel-gantt" style="display:none;">
+    <div class="day-nav">
+      <div class="day-nav-center">
+        <button class="day-btn" id="prevDay" onclick="changeDay(-1)">&larr; Prev Day</button>
+        <h2 id="dayTitle">-</h2>
+        <button class="day-btn" id="nextDay" onclick="changeDay(1)">Next Day &rarr;</button>
+      </div>
+      <div style="display:flex;gap:16px;align-items:center;">
+        <div class="day-indicator" id="dayIndicator"></div>
+        <div class="legend">
+          <div class="legend-item"><div class="legend-swatch" style="background:var(--blue)"></div>Job</div>
+          <div class="legend-item"><div class="legend-swatch" style="background:var(--red)"></div>P+</div>
+          <div class="legend-item"><div class="legend-swatch" style="background:var(--pink)"></div>Priority</div>
+          <div class="legend-item"><div class="legend-swatch" style="background:var(--orange)"></div>Changeover</div>
+          <div class="legend-item"><div class="legend-swatch" style="background:var(--purple)"></div>Tool Swap</div>
+          <div class="legend-item"><div class="legend-swatch" style="background:var(--surface2);border:1px dashed var(--border)"></div>Idle</div>
+        </div>
+      </div>
+    </div>
+    <div id="dayGantt"></div>
+    <div class="day-summary" id="daySummary"></div>
+  </div>
+
+  <!-- Machines Tab -->
+  <div class="tab-panel" id="panel-machines" style="display:none;">
+    <table class="data-table" id="machineTable">
+      <thead><tr>
+        <th>Machine</th><th>Jobs</th><th>Job Hours</th><th>CO Hours</th>
+        <th>Idle Hours</th><th>No Crew Hours</th><th>Utilization</th><th>Start</th><th>End</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <!-- Crew Tab -->
+  <div class="tab-panel" id="panel-crew" style="display:none;">
+    <div class="crew-list" id="crewList"></div>
+  </div>
+
+  <!-- Jobs Tab -->
+  <div class="tab-panel" id="panel-jobs" style="display:none;">
+    <table class="data-table" id="jobsTable">
+      <thead><tr>
+        <th>SO #</th><th>Machine</th><th>Tool</th><th>Start</th><th>End</th>
+        <th>Run Hrs</th><th>HC</th><th>Customer</th><th>Due Date</th><th>Priority</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+// ── State ──────────────────────────────────────────────
+let scheduleData = null;
+let selectedFile = null;
+let currentDayIndex = 0;
+let scheduleDays = []; // list of Date objects (working days with entries)
+
+const MACHINE_ORDER = ['16A','16B','16C','20','8','LMB','SMB','6ST','RF'];
+const SHIFT1_START_H = 6.5;  // 06:30
+const SHIFT1_END_H = 14.5;   // 14:30
+const SHIFT2_END_H = 22.5;   // 22:30
+const DAY_HOURS = SHIFT2_END_H - SHIFT1_START_H; // 16h total
+
+// ── File handling ──────────────────────────────────────
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  selectedFile = e.target.files[0];
+  document.getElementById('fileName').textContent = selectedFile ? selectedFile.name : '';
+  document.getElementById('runBtn').disabled = !selectedFile;
+});
+
+document.getElementById('refDate').value = new Date().toISOString().split('T')[0];
+
+// ── Tabs ───────────────────────────────────────────────
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => { p.classList.remove('active'); p.style.display = 'none'; });
+    tab.classList.add('active');
+    const panel = document.getElementById('panel-' + tab.dataset.tab);
+    panel.classList.add('active');
+    panel.style.display = 'block';
+  });
+});
+
+// ── API Call ───────────────────────────────────────────
+async function runSchedule() {
+  if (!selectedFile) return;
+  document.getElementById('emptyState').style.display = 'none';
+  document.getElementById('loading').classList.add('show');
+  document.getElementById('statsBar').style.display = 'none';
+  document.getElementById('tabsBar').style.display = 'none';
+  document.querySelectorAll('.tab-panel').forEach(p => p.style.display = 'none');
+
+  const formData = new FormData();
+  formData.append('schedule_file', selectedFile);
+  formData.append('reference_date', document.getElementById('refDate').value);
+  formData.append('reference_time', document.getElementById('refTime').value);
+  formData.append('max_concurrent', document.getElementById('maxConcurrent').value);
+
+  try {
+    const resp = await fetch('/api/schedule', { method: 'POST', body: formData });
+    scheduleData = await resp.json();
+    document.getElementById('loading').classList.remove('show');
+    onScheduleLoaded();
+  } catch (err) {
+    document.getElementById('loading').classList.remove('show');
+    alert('Error: ' + err.message);
+  }
+}
+
+// ── On schedule loaded ─────────────────────────────────
+function onScheduleLoaded() {
+  if (!scheduleData) return;
+
+  document.getElementById('statsBar').style.display = 'flex';
+  document.getElementById('tabsBar').style.display = 'flex';
+  document.getElementById('panel-gantt').style.display = 'block';
+
+  document.getElementById('statStatus').textContent = scheduleData.solver_status;
+  document.getElementById('statJobs').textContent = scheduleData.total_jobs;
+  document.getElementById('statMakespan').textContent = scheduleData.makespan_hours + 'h';
+  document.getElementById('statCrew').textContent = scheduleData.crew_movements.length;
+  document.getElementById('statSkipped').textContent = scheduleData.skipped_count;
+
+  // Compute working days that have entries
+  computeDays();
+  currentDayIndex = 0;
+  renderDay();
+  renderMachineTable();
+  renderCrewMovements();
+  renderJobsTable();
+}
+
+function computeDays() {
+  const daySet = new Set();
+  scheduleData.schedule.forEach(e => {
+    const d = new Date(e.start);
+    daySet.add(d.toISOString().split('T')[0]);
+    const d2 = new Date(e.end);
+    daySet.add(d2.toISOString().split('T')[0]);
+  });
+  scheduleDays = Array.from(daySet).sort().map(s => new Date(s + 'T00:00:00'));
+}
+
+function changeDay(delta) {
+  currentDayIndex = Math.max(0, Math.min(scheduleDays.length - 1, currentDayIndex + delta));
+  renderDay();
+}
+
+// ── Day Gantt Rendering ────────────────────────────────
+function renderDay() {
+  if (!scheduleDays.length) return;
+  const day = scheduleDays[currentDayIndex];
+  const dayStr = day.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+
+  document.getElementById('dayTitle').textContent = dayStr;
+  document.getElementById('dayIndicator').textContent = `Day ${currentDayIndex + 1} of ${scheduleDays.length}`;
+  document.getElementById('prevDay').disabled = currentDayIndex === 0;
+  document.getElementById('nextDay').disabled = currentDayIndex === scheduleDays.length - 1;
+
+  // Day boundaries: 06:30 to 22:30
+  const dayStart = new Date(day); dayStart.setHours(6, 30, 0, 0);
+  const dayEnd = new Date(day); dayEnd.setHours(22, 30, 0, 0);
+  const dayStartMs = dayStart.getTime();
+  const dayEndMs = dayEnd.getTime();
+
+  // Filter entries that overlap this day
+  const dayEntries = scheduleData.schedule.filter(e => {
+    const es = new Date(e.start).getTime();
+    const ee = new Date(e.end).getTime();
+    return es < dayEndMs && ee > dayStartMs;
+  });
+
+  // Group by machine
+  const byMachine = {};
+  dayEntries.forEach(e => {
+    if (!byMachine[e.machine_id]) byMachine[e.machine_id] = [];
+    byMachine[e.machine_id].push(e);
+  });
+
+  const activeMachines = MACHINE_ORDER.filter(m => byMachine[m]);
+
+  let html = '';
+  html += '<div class="day-gantt">';
+
+  // Shift headers
+  html += '<div class="shift-header">';
+  html += '<div class="machine-col"></div>';
+  html += '<div class="shift-col">Shift 1 (06:30 - 14:30)</div>';
+  html += '<div class="shift-col">Shift 2 (14:30 - 22:30)</div>';
+  html += '</div>';
+
+  // Time ruler
+  html += '<div class="time-ruler">';
+  html += '<div class="machine-col"></div>';
+  html += '<div class="shift-track" style="position:relative;">';
+  for (let h = 7; h <= 22; h++) {
+    const pct = ((h - SHIFT1_START_H) / DAY_HOURS) * 100;
+    if (pct >= 0 && pct <= 100) {
+      html += `<span class="hour-mark" style="left:${pct}%">${h}:00</span>`;
+    }
+  }
+  html += '</div>';
+  html += '</div>';
+
+  // Machine rows
+  if (activeMachines.length === 0) {
+    html += '<div style="padding:40px;text-align:center;color:var(--text-dim);">No activity this day</div>';
+  }
+
+  activeMachines.forEach(mid => {
+    html += '<div class="machine-row">';
+    html += `<div class="machine-col">${mid}</div>`;
+    html += '<div class="shift-track">';
+
+    // Hour gridlines
+    for (let h = 7; h <= 22; h++) {
+      const pct = ((h - SHIFT1_START_H) / DAY_HOURS) * 100;
+      if (pct > 0 && pct < 100) {
+        html += `<div class="hour-line" style="left:${pct}%"></div>`;
+      }
+    }
+
+    // Shift divider at 14:30
+    const shiftDivPct = ((SHIFT1_END_H - SHIFT1_START_H) / DAY_HOURS) * 100;
+    html += `<div class="shift-divider" style="left:${shiftDivPct}%"></div>`;
+
+    // Bars
+    (byMachine[mid] || []).forEach(e => {
+      const es = Math.max(new Date(e.start).getTime(), dayStartMs);
+      const ee = Math.min(new Date(e.end).getTime(), dayEndMs);
+      if (ee <= es) return;
+
+      const leftPct = ((es - dayStartMs) / (dayEndMs - dayStartMs)) * 100;
+      const widthPct = ((ee - es) / (dayEndMs - dayStartMs)) * 100;
+
+      let cls = e.type.toLowerCase();
+      if (e.type === 'JOB' && e.priority_class !== undefined && e.priority_class <= 2) {
+        cls += ' prio-' + e.priority_class;
+      }
+
+      let label = '';
+      let toolLabel = '';
+      if (e.type === 'JOB') {
+        label = e.so_number || '';
+        toolLabel = e.tool_id || '';
+      } else if (e.type === 'CHANGEOVER') {
+        label = 'CO';
+        toolLabel = e.tool_id || '';
+      } else if (e.type === 'TOOL_SWAP') {
+        label = 'TS';
+      } else {
+        label = '';
+      }
+
+      const dataAttr = `data-entry='${JSON.stringify(e).replace(/'/g, "&#39;")}'`;
+      html += `<div class="bar ${cls}" style="left:${leftPct}%;width:${widthPct}%" ${dataAttr} onmouseenter="showTooltip(event)" onmouseleave="hideTooltip()">`;
+      if (widthPct > 5) {
+        html += `<span class="bar-text">${label}</span>`;
+        if (widthPct > 12 && toolLabel) html += `<span class="bar-tool">${toolLabel}</span>`;
+      }
+      html += '</div>';
+    });
+
+    html += '</div>'; // shift-track
+    html += '</div>'; // machine-row
+  });
+
+  html += '</div>'; // day-gantt
+
+  document.getElementById('dayGantt').innerHTML = html;
+
+  // Day summary
+  renderDaySummary(dayEntries, dayStartMs, dayEndMs);
+}
+
+function renderDaySummary(dayEntries, dayStartMs, dayEndMs) {
+  const jobs = dayEntries.filter(e => e.type === 'JOB');
+  const cos = dayEntries.filter(e => e.type === 'CHANGEOVER' || e.type === 'TOOL_SWAP');
+  // Idle = crew present but waiting. No-crew = machine empty.
+  const idleCrew = dayEntries.filter(e => e.type === 'NOT_RUNNING' && e.idle_type === 'CREW_WAITING');
+  const noCrew = dayEntries.filter(e => e.type === 'NOT_RUNNING' && e.idle_type !== 'CREW_WAITING');
+
+  const clamp = (e) => {
+    const s = Math.max(new Date(e.start).getTime(), dayStartMs);
+    const en = Math.min(new Date(e.end).getTime(), dayEndMs);
+    return Math.max(0, (en - s) / 3600000);
+  };
+
+  const jobHrs = jobs.reduce((sum, e) => sum + clamp(e), 0);
+  const coHrs = cos.reduce((sum, e) => sum + clamp(e), 0);
+  const idleHrs = idleCrew.reduce((sum, e) => sum + clamp(e), 0);
+  const noCrewHrs = noCrew.reduce((sum, e) => sum + clamp(e), 0);
+  const activeMachines = new Set(dayEntries.map(e => e.machine_id)).size;
+
+  // Crew movements this day
+  const day = scheduleDays[currentDayIndex];
+  const dayDateStr = day.toISOString().split('T')[0];
+  const dayCrew = scheduleData.crew_movements.filter(cm => cm.time.startsWith(dayDateStr));
+
+  let html = '';
+  html += card('Active Machines', activeMachines);
+  html += card('Jobs Today', jobs.length);
+  html += card('Job Hours', jobHrs.toFixed(1) + 'h');
+  html += card('Changeover Hours', coHrs.toFixed(1) + 'h');
+  html += card('Crew Idle Hours', idleHrs.toFixed(1) + 'h');
+  html += card('No Crew Hours', noCrewHrs.toFixed(1) + 'h');
+  html += card('Crew Jumps', dayCrew.length);
+
+  document.getElementById('daySummary').innerHTML = html;
+}
+
+function card(label, value) {
+  return `<div class="day-summary-card"><div class="ds-label">${label}</div><div class="ds-value">${value}</div></div>`;
+}
+
+// ── Tooltip ────────────────────────────────────────────
+function showTooltip(event) {
+  const bar = event.currentTarget;
+  const e = JSON.parse(bar.dataset.entry);
+  const tt = document.getElementById('tooltip');
+  const prioLabels = ['Priority+', 'Priority', 'Past Due', 'Normal'];
+
+  let html = '';
+  if (e.type === 'JOB') {
+    html += `<div class="tt-title">${e.so_number || 'Job'}</div>`;
+    html += ttRow('Machine', e.machine_id);
+    html += ttRow('Tool', e.tool_id);
+    html += ttRow('Customer', e.customer || '-');
+    html += ttRow('Description', e.description || '-');
+    html += ttRow('Start', fmtDt(e.start));
+    html += ttRow('End', fmtDt(e.end));
+    html += ttRow('Run Hours', (e.run_hours || 0).toFixed(1) + 'h');
+    html += ttRow('Headcount', e.headcount || '-');
+    html += ttRow('Due Date', e.due_date ? fmtDt(e.due_date) : '-');
+    html += ttRow('Priority', prioLabels[e.priority_class] || '-');
+    if (e.crew_from) html += ttRow('Crew From', e.crew_from);
+    if (e.crew_to) html += ttRow('Crew To', e.crew_to);
+  } else if (e.type === 'CHANGEOVER' || e.type === 'TOOL_SWAP') {
+    html += `<div class="tt-title">${e.type.replace('_',' ')}</div>`;
+    html += ttRow('Machine', e.machine_id);
+    html += ttRow('Tool Change', e.tool_id || '-');
+    html += ttRow('Start', fmtDt(e.start));
+    html += ttRow('End', fmtDt(e.end));
+    if (e.crew_to) html += ttRow('Crew Jumped To', e.crew_to);
+  } else {
+    html += `<div class="tt-title">Not Running</div>`;
+    html += ttRow('Machine', e.machine_id);
+    html += ttRow('Start', fmtDt(e.start));
+    html += ttRow('End', fmtDt(e.end));
+    html += ttRow('Reason', e.idle_type || '-');
+  }
+
+  tt.innerHTML = html;
+  tt.classList.add('show');
+  const rect = bar.getBoundingClientRect();
+  const ttHeight = tt.offsetHeight;
+  const spaceBelow = window.innerHeight - rect.bottom;
+  const spaceAbove = rect.top;
+
+  tt.style.left = Math.min(rect.left, window.innerWidth - 360) + 'px';
+  if (spaceBelow < ttHeight + 16 && spaceAbove > spaceBelow) {
+    tt.style.top = (rect.top - ttHeight - 8) + 'px';
+  } else {
+    tt.style.top = (rect.bottom + 8) + 'px';
+  }
+}
+
+function hideTooltip() { document.getElementById('tooltip').classList.remove('show'); }
+
+function ttRow(label, value) {
+  return `<div class="tt-row"><span class="tt-label">${label}</span><span class="tt-value">${value}</span></div>`;
+}
+
+function fmtDt(iso) {
+  if (!iso) return '-';
+  const d = new Date(iso);
+  return d.toLocaleDateString('en-US',{month:'short',day:'numeric'}) + ' ' +
+    d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false});
+}
+
+// ── Machine Table ──────────────────────────────────────
+function renderMachineTable() {
+  const tbody = document.querySelector('#machineTable tbody');
+  const machines = scheduleData.machines;
+  let html = '';
+  Object.keys(machines).sort().forEach(mid => {
+    const m = machines[mid];
+    const w = Math.max(0, Math.min(100, m.utilization));
+    html += `<tr>
+      <td><strong>${mid}</strong></td>
+      <td>${m.jobs}</td><td>${m.job_hours}h</td><td>${m.changeover_hours}h</td>
+      <td>${m.idle_hours}h</td><td>${m.no_crew_hours || 0}h</td>
+      <td><div class="util-bar" style="width:${w}px"></div>${m.utilization}%</td>
+      <td>${m.start ? fmtDt(m.start) : '-'}</td><td>${m.end ? fmtDt(m.end) : '-'}</td>
+    </tr>`;
+  });
+  tbody.innerHTML = html;
+}
+
+// ── Crew Movements ─────────────────────────────────────
+function renderCrewMovements() {
+  const container = document.getElementById('crewList');
+  let html = '';
+  scheduleData.crew_movements.forEach(cm => {
+    html += `<div class="crew-item">
+      <span class="crew-time">${fmtDt(cm.time)}</span>
+      <strong>${cm.from_machine}</strong>
+      <span class="crew-arrow">&rarr;</span>
+      <strong>${cm.to_machine}</strong>
+      <span class="crew-hc">${cm.headcount} workers</span>
+      <span style="color:var(--text-dim)">${cm.reason}</span>
+    </div>`;
+  });
+  if (!html) html = '<p style="color:var(--text-dim);padding:20px;">No crew movements</p>';
+  container.innerHTML = html;
+}
+
+// ── Jobs Table ─────────────────────────────────────────
+function renderJobsTable() {
+  const tbody = document.querySelector('#jobsTable tbody');
+  const jobs = scheduleData.schedule.filter(e => e.type === 'JOB');
+  jobs.sort((a,b) => new Date(a.start) - new Date(b.start));
+  const prioLabels = ['P+','Priority','Past Due','Normal'];
+  let html = '';
+  jobs.forEach(j => {
+    html += `<tr>
+      <td><strong>${j.so_number||'-'}</strong></td>
+      <td>${j.machine_id}</td><td>${j.tool_id||'-'}</td>
+      <td>${fmtDt(j.start)}</td><td>${fmtDt(j.end)}</td>
+      <td>${(j.run_hours||0).toFixed(1)}</td><td>${j.headcount||'-'}</td>
+      <td>${j.customer||'-'}</td><td>${j.due_date?fmtDt(j.due_date):'-'}</td>
+      <td>${prioLabels[j.priority_class]||'-'}</td>
+    </tr>`;
+  });
+  tbody.innerHTML = html;
+}
+
+// ── Keyboard nav ───────────────────────────────────────
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowLeft') changeDay(-1);
+  if (e.key === 'ArrowRight') changeDay(1);
+});
+</script>
+</body>
+</html>
