@@ -264,16 +264,17 @@ def solve_schedule(
 
     objective = makespan
 
-    # Priority boost: heavily penalize late starts of P+ / picked batches
+    # Priority boost: penalize late starts of priority batches
     if cfg.priority_boost:
-        prio_starts = []
+        boost_terms = []
         for b in batches:
-            has_prio = any(j.get("priority_class", 3) <= 0 for j in b.jobs)
-            if has_prio:
-                prio_starts.append(starts[b.batch_id])
-        if prio_starts:
-            # Weight P+ starts 50x heavier than makespan
-            objective = makespan + 50 * sum(prio_starts)
+            min_prio = min((j.get("priority_class", 3) for j in b.jobs), default=3)
+            if min_prio <= 0:       # P+ / picked / in-progress
+                boost_terms.append(50 * starts[b.batch_id])
+            elif min_prio <= 2:     # Priority or Past Due
+                boost_terms.append(40 * starts[b.batch_id])
+        if boost_terms:
+            objective = makespan + sum(boost_terms)
 
     model.minimize(objective)
 
@@ -281,6 +282,7 @@ def solve_schedule(
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit_seconds
+    solver.parameters.num_workers = 8
 
     status = solver.solve(model)
 
