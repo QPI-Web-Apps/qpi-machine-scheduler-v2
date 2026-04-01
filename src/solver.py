@@ -176,7 +176,7 @@ def solve_schedule(
     batches: list[ToolBatch],
     cfg: SchedulerConfig,
     max_concurrent: int = 5,
-    time_limit_seconds: float = 30.0,
+    time_limit_seconds: float = 120.0,
 ) -> SolverResult:
     """Find optimal batch ordering and timing using CP-SAT.
 
@@ -270,9 +270,9 @@ def solve_schedule(
         for b in batches:
             min_prio = min((j.get("priority_class", 3) for j in b.jobs), default=3)
             if min_prio <= 0:       # P+ / picked / in-progress
-                boost_terms.append(50 * starts[b.batch_id])
+                boost_terms.append(10 * starts[b.batch_id])
             elif min_prio <= 2:     # Priority or Past Due
-                boost_terms.append(40 * starts[b.batch_id])
+                boost_terms.append(5 * starts[b.batch_id])
         if boost_terms:
             objective = makespan + sum(boost_terms)
 
