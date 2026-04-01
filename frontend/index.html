@@ -64,6 +64,9 @@
   <div class="stat-card"><div class="label">Makespan</div><div class="value" id="statMakespan">-</div></div>
   <div class="stat-card"><div class="label">Crew Movements</div><div class="value orange" id="statCrew">-</div></div>
   <div class="stat-card"><div class="label">Skipped</div><div class="value" id="statSkipped">-</div></div>
+  <div class="stat-card"><div class="label">On Time</div><div class="value green" id="statOnTime">-</div></div>
+  <div class="stat-card"><div class="label">Past Due</div><div class="value" id="statPastDue" style="color:var(--red)">-</div></div>
+  <div class="stat-card"><div class="label">Will Finish Late</div><div class="value orange" id="statLate">-</div></div>
 </div>
 
 <div class="tabs" id="tabsBar" style="display:none;">
@@ -372,6 +375,20 @@ function onScheduleLoaded() {
   document.getElementById('statMakespan').textContent = scheduleData.makespan_hours + 'h';
   document.getElementById('statCrew').textContent = scheduleData.crew_movements.length;
   document.getElementById('statSkipped').textContent = scheduleData.skipped_count;
+
+  // Delivery stats
+  let onTime = 0, pastDue = 0, finishLate = 0;
+  scheduleData.schedule.filter(e => e.type === 'JOB').forEach(j => {
+    if (!j.due_date) return;
+    const end = new Date(j.end).getTime();
+    const due = new Date(j.due_date).getTime();
+    if (j.priority_class === 2) pastDue++;
+    else if (end > due) finishLate++;
+    else onTime++;
+  });
+  document.getElementById('statOnTime').textContent = onTime;
+  document.getElementById('statPastDue').textContent = pastDue;
+  document.getElementById('statLate').textContent = finishLate;
 
   // Compute working days that have entries
   computeDays();
