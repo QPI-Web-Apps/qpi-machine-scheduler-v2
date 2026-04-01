@@ -317,6 +317,35 @@ table.data-table td { font-variant-numeric: tabular-nums; }
   background: var(--accent); vertical-align: middle; margin-right: 6px;
 }
 
+/* ── Headcount Table ────────────────────────────────── */
+.headcount-table {
+  width: 100%; border-collapse: collapse; font-size: 13px;
+  background: var(--surface); border-radius: 8px; overflow: hidden;
+  border: 1px solid var(--border);
+}
+
+.headcount-table th, .headcount-table td {
+  padding: 8px 12px; text-align: center;
+  border-bottom: 1px solid var(--border);
+  font-variant-numeric: tabular-nums;
+}
+
+.headcount-table th {
+  font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.04em; color: var(--text-dim);
+  background: var(--surface); position: sticky; top: 0; z-index: 2;
+}
+
+.headcount-table td.day-cell { text-align: left; font-weight: 600; white-space: nowrap; vertical-align: middle; }
+.headcount-table td.shift-cell { color: var(--text-dim); font-size: 12px; }
+.headcount-table td.hc-zero { color: var(--text-dim); }
+.headcount-table td.hc-total { font-weight: 700; }
+.headcount-table td.hc-total.hc-green { color: var(--green); }
+.headcount-table td.hc-total.hc-orange { color: var(--orange); }
+.headcount-table td.hc-total.hc-red { color: var(--red); }
+.headcount-table tr.hc-peak { background: rgba(108, 123, 247, 0.08); }
+.headcount-table tr.hc-shift2 { background: var(--surface2); }
+
 /* ── Crew List ──────────────────────────────────────── */
 .crew-list { display: flex; flex-direction: column; gap: 6px; }
 
@@ -365,9 +394,9 @@ table.data-table td { font-variant-numeric: tabular-nums; }
 <header>
   <h1><span>QPI</span> Machine Scheduler</h1>
   <div class="upload-area">
-    <label>Date:</label>
+    <label>Start Date:</label>
     <input type="date" id="refDate">
-    <label>Time:</label>
+    <label>Start Time:</label>
     <input type="time" id="refTime" value="06:30">
     <label>Max machines:</label>
     <input type="number" id="maxConcurrent" value="5" min="1" max="9">
@@ -390,6 +419,7 @@ table.data-table td { font-variant-numeric: tabular-nums; }
   <div class="tab active" data-tab="gantt">Day View</div>
   <div class="tab" data-tab="machines">Machines</div>
   <div class="tab" data-tab="crew">Crew Movements</div>
+  <div class="tab" data-tab="headcount">Headcount</div>
   <div class="tab" data-tab="jobs">All Jobs</div>
 </div>
 
@@ -438,6 +468,11 @@ table.data-table td { font-variant-numeric: tabular-nums; }
   <!-- Crew Tab -->
   <div class="tab-panel" id="panel-crew" style="display:none;">
     <div class="crew-list" id="crewList"></div>
+  </div>
+
+  <!-- Headcount Tab -->
+  <div class="tab-panel" id="panel-headcount" style="display:none;">
+    <div id="headcountContent"></div>
   </div>
 
   <!-- Jobs Tab -->
@@ -534,6 +569,7 @@ function onScheduleLoaded() {
   renderDay();
   renderMachineTable();
   renderCrewMovements();
+  renderHeadcount();
   renderJobsTable();
 }
 
@@ -820,6 +856,134 @@ function renderCrewMovements() {
   });
   if (!html) html = '<p style="color:var(--text-dim);padding:20px;">No crew movements</p>';
   container.innerHTML = html;
+}
+
+// ── Headcount Table ────────────────────────────────────
+
+// Sweep-line: peak concurrent headcount across all machines at any instant
+function peakConcurrentHC(shiftJobs, ssMs, seMs) {
+  const events = [];
+  shiftJobs.forEach(j => {
+    const js = Math.max(new Date(j.start).getTime(), ssMs);
+    const je = Math.min(new Date(j.end).getTime(), seMs);
+    if (je > js) {
+      const hc = j.headcount || 0;
+      events.push({ time: js, delta: +hc });
+      events.push({ time: je, delta: -hc });
+    }
+  });
+  // Sort: by time, then ends (-delta) before starts (+delta) at same time
+  events.sort((a, b) => a.time - b.time || a.delta - b.delta);
+  let current = 0, peak = 0;
+  events.forEach(ev => {
+    current += ev.delta;
+    if (current > peak) peak = current;
+  });
+  return peak;
+}
+
+// Average headcount: total worker-hours / shift duration
+function avgHC(shiftJobs, ssMs, seMs) {
+  const shiftHrs = (seMs - ssMs) / 3600000;
+  if (shiftHrs <= 0) return 0;
+  let workerHours = 0;
+  shiftJobs.forEach(j => {
+    const js = Math.max(new Date(j.start).getTime(), ssMs);
+    const je = Math.min(new Date(j.end).getTime(), seMs);
+    if (je > js) {
+      workerHours += (j.headcount || 0) * ((je - js) / 3600000);
+    }
+  });
+  return workerHours / shiftHrs;
+}
+
+function renderHeadcount() {
+  if (!scheduleData || !scheduleDays.length) return;
+
+  const allJobs = scheduleData.schedule.filter(e => e.type === 'JOB');
+  const rows = [];
+
+  scheduleDays.forEach(day => {
+    for (let shift = 1; shift <= 2; shift++) {
+      const ss = new Date(day);
+      const se = new Date(day);
+      if (shift === 1) { ss.setHours(6,30,0,0); se.setHours(14,30,0,0); }
+      else { ss.setHours(14,30,0,0); se.setHours(22,30,0,0); }
+      const ssMs = ss.getTime(), seMs = se.getTime();
+
+      // Jobs overlapping this shift
+      const shiftJobs = allJobs.filter(j => {
+        const js = new Date(j.start).getTime();
+        const je = new Date(j.end).getTime();
+        return js < seMs && je > ssMs;
+      });
+
+      // Per-machine: max headcount (informational — which machines run and their crew size)
+      const machineHC = {};
+      MACHINE_ORDER.forEach(mid => { machineHC[mid] = 0; });
+      shiftJobs.forEach(j => {
+        const hc = j.headcount || 0;
+        if (hc > machineHC[j.machine_id]) machineHC[j.machine_id] = hc;
+      });
+
+      // Total: peak concurrent (accounts for crew jumps — same workers not double-counted)
+      const peak = peakConcurrentHC(shiftJobs, ssMs, seMs);
+      const avg = avgHC(shiftJobs, ssMs, seMs);
+
+      rows.push({ day, shift, machineHC, peak, avg });
+    }
+  });
+
+  const overallPeak = Math.max(...rows.map(r => r.peak));
+  const overallAvg = rows.length ? rows.reduce((s, r) => s + r.avg, 0) / rows.length : 0;
+
+  // Summary cards
+  let html = '<div class="day-summary" style="margin-bottom:16px;">';
+  html += card('Peak Shift HC', Math.round(overallPeak) + ' workers');
+  html += card('Avg Shift HC', overallAvg.toFixed(1) + ' workers');
+  html += card('Schedule Days', scheduleDays.length);
+  html += '</div>';
+
+  // Table
+  html += '<table class="headcount-table"><thead><tr>';
+  html += '<th>Day</th><th>Shift</th>';
+  MACHINE_ORDER.forEach(mid => { html += `<th>${mid}</th>`; });
+  html += '<th>Peak</th><th>Avg</th></tr></thead><tbody>';
+
+  rows.forEach(row => {
+    const isPeak = row.peak === overallPeak && overallPeak > 0;
+    const cls = [];
+    if (isPeak) cls.push('hc-peak');
+    if (row.shift === 2) cls.push('hc-shift2');
+
+    html += `<tr class="${cls.join(' ')}">`;
+
+    if (row.shift === 1) {
+      const dayLabel = row.day.toLocaleDateString('en-US', { weekday:'short', month:'numeric', day:'numeric' });
+      html += `<td class="day-cell" rowspan="2">${dayLabel}</td>`;
+    }
+
+    html += `<td class="shift-cell">${row.shift}</td>`;
+
+    MACHINE_ORDER.forEach(mid => {
+      const hc = row.machineHC[mid];
+      if (hc === 0) {
+        html += '<td class="hc-zero">-</td>';
+      } else {
+        html += `<td>${Number.isInteger(hc) ? hc : hc.toFixed(1)}</td>`;
+      }
+    });
+
+    // Peak concurrent (main number)
+    const peakCls = row.peak > 40 ? 'hc-red' : row.peak >= 30 ? 'hc-orange' : 'hc-green';
+    html += `<td class="hc-total ${peakCls}">${Math.round(row.peak)}</td>`;
+    // Average
+    html += `<td class="hc-total" style="color:var(--text-dim)">${row.avg.toFixed(1)}</td>`;
+    html += '</tr>';
+  });
+
+  html += '</tbody></table>';
+  document.getElementById('headcountContent').innerHTML = html;
 }
 
 // ── Jobs Table ─────────────────────────────────────────
