@@ -46,6 +46,7 @@ class SchedulerConfig:
     min_remaining_shift_hours: float = 1.0
     h3_enabled: bool = True
     initial_tools: dict[str, str] = field(default_factory=dict)
+    priority_boost: bool = False
 
     def get_day_shift_map(self, machine_id: str):
         """Return per-day shift map for a machine, or int fallback."""

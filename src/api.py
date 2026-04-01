@@ -160,6 +160,7 @@ async def create_schedule(
     include_white: bool = Form(default=False),
     shift_config: str = Form(default=""),
     initial_tools: str = Form(default=""),
+    priority_boost: bool = Form(default=False),
 ):
     """Upload Excel, generate schedule, return JSON."""
     # Parse reference date/time
@@ -177,6 +178,7 @@ async def create_schedule(
         include_yellow=include_yellow,
         include_pink=include_pink,
         include_white=include_white,
+        priority_boost=priority_boost,
     )
 
     # Parse per-machine-per-day shift config if provided

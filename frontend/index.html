@@ -38,6 +38,7 @@
       <label class="ticket-toggle"><input type="checkbox" id="inclPink"><span class="ticket-chip pink">Pink</span></label>
       <label class="ticket-toggle"><input type="checkbox" id="inclWhite"><span class="ticket-chip white">White</span></label>
     </div>
+    <label class="ticket-toggle"><input type="checkbox" id="prioBoost"><span class="ticket-chip boost">P+ Boost</span></label>
     <button class="day-btn" onclick="toggleShiftPanel()">Shifts</button>
   </div>
 </header>
@@ -345,6 +346,7 @@ async function runSchedule() {
   formData.append('include_pink', document.getElementById('inclPink').checked);
   formData.append('include_white', document.getElementById('inclWhite').checked);
   formData.append('initial_tools', JSON.stringify(getInitialTools()));
+  formData.append('priority_boost', document.getElementById('prioBoost').checked);
 
   try {
     const resp = await fetch('/api/schedule', { method: 'POST', body: formData });

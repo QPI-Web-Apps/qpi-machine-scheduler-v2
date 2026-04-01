@@ -256,12 +256,26 @@ def solve_schedule(
     all_demands = [1] * len(batches)
     model.add_cumulative(all_intervals, all_demands, max_concurrent)
 
-    # ── Objective: minimize makespan ────────────────────────────
+    # ── Objective: minimize makespan + priority boost ────────────
 
     makespan = model.new_int_var(0, horizon, "makespan")
     for b in batches:
         model.add(makespan >= ends[b.batch_id])
-    model.minimize(makespan)
+
+    objective = makespan
+
+    # Priority boost: heavily penalize late starts of P+ / picked batches
+    if cfg.priority_boost:
+        prio_starts = []
+        for b in batches:
+            has_prio = any(j.get("priority_class", 3) <= 0 for j in b.jobs)
+            if has_prio:
+                prio_starts.append(starts[b.batch_id])
+        if prio_starts:
+            # Weight P+ starts 50x heavier than makespan
+            objective = makespan + 50 * sum(prio_starts)
+
+    model.minimize(objective)
 
     # ── Solve ───────────────────────────────────────────────────
 
