@@ -157,7 +157,9 @@ header h1 span { color: var(--accent); font-weight: 700; }
   background: var(--surface); border: 1px solid var(--border);
   border-radius: 8px; overflow: hidden;
   box-shadow: 0 1px 3px rgba(15,23,42,0.05);
+  position: relative;
 }
+.crew-arrows { z-index: 3; }
 .shift-header {
   display: flex; border-bottom: 1px solid var(--border); background: var(--surface2);
 }

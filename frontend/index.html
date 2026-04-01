@@ -510,6 +510,37 @@ function renderDay() {
     html += '</div>'; // machine-row
   });
 
+  // ── Crew movement arrows (SVG overlay) ──────────────
+  const headerH = 30, rulerH = 18, rowH = 44, machineColW = 52;
+  const svgH = activeMachines.length * rowH;
+  const vbW = 1000; // viewBox width maps to 100% of the track
+  const dayDateStr2 = localDateStr(day);
+  const dayCrew = scheduleData.crew_movements.filter(cm => cm.time.startsWith(dayDateStr2));
+
+  if (dayCrew.length > 0 && activeMachines.length > 1) {
+    html += `<svg class="crew-arrows" viewBox="0 0 ${vbW} ${svgH}" preserveAspectRatio="none" style="position:absolute;top:${headerH + rulerH}px;left:${machineColW}px;width:calc(100% - ${machineColW}px);height:${svgH}px;pointer-events:none;">`;
+    html += '<defs><marker id="arrow" viewBox="0 0 6 6" refX="5" refY="3" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,1 L5,3 L0,5 Z" fill="#0f172a"/></marker></defs>';
+
+    dayCrew.forEach(cm => {
+      const fromIdx = activeMachines.indexOf(cm.from_machine);
+      const toIdx = activeMachines.indexOf(cm.to_machine);
+      if (fromIdx < 0 || toIdx < 0) return;
+
+      const cmTime = new Date(cm.time).getTime();
+      const xFrac = (cmTime - dayStartMs) / (dayEndMs - dayStartMs);
+      if (xFrac < 0 || xFrac > 1) return;
+
+      const x = xFrac * vbW;
+      const y1 = fromIdx * rowH + rowH / 2;
+      const y2 = toIdx * rowH + rowH / 2;
+      const dx = 20; // curve offset in viewBox units
+
+      html += `<path d="M ${x} ${y1} C ${x + dx} ${y1}, ${x + dx} ${y2}, ${x} ${y2}" fill="none" stroke="#0f172a" stroke-width="2" marker-end="url(#arrow)" opacity="0.7" vector-effect="non-scaling-stroke"/>`;
+    });
+
+    html += '</svg>';
+  }
+
   html += '</div>'; // day-gantt
 
   document.getElementById('dayGantt').innerHTML = html;
