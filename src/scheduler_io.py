@@ -11,6 +11,7 @@ import openpyxl
 
 from .helpers import (
     DEFAULT_HEADCOUNT,
+    PriorityClass,
     classify_priority,
     compute_run_hours,
     infer_machine_from_eqp,
@@ -211,8 +212,21 @@ def load_jobs_from_excel(path: str, cfg: SchedulerConfig) -> tuple[list[dict], l
         # Flags
         is_labeler = parse_boolish(raw.get("is_labeler"))
         is_bagger = parse_boolish(raw.get("is_bagger"))
-        is_in_progress = parse_boolish(raw.get("is_in_progress"))
-        is_picked = parse_boolish(raw.get("is_picked"))
+
+        # Parse In-progress / Picked as EQP codes → machine locks
+        raw_ip = _safe_str(raw.get("is_in_progress"))
+        raw_pk = _safe_str(raw.get("is_picked"))
+        in_progress_machine = infer_machine_from_eqp(raw_ip) if raw_ip else None
+        picked_machine = infer_machine_from_eqp(raw_pk) if raw_pk else None
+        is_in_progress = in_progress_machine is not None
+        is_picked = picked_machine is not None and not is_in_progress
+        locked_machine = in_progress_machine or picked_machine
+
+        # Override priority for locked jobs
+        if is_in_progress:
+            priority_class = int(PriorityClass.IN_PROGRESS)
+        elif is_picked:
+            priority_class = int(PriorityClass.PRIORITY_PLUS)
 
         # Machine eligibility
         preferred_machine = infer_machine_from_eqp(eqp_code)
@@ -220,6 +234,10 @@ def load_jobs_from_excel(path: str, cfg: SchedulerConfig) -> tuple[list[dict], l
         if not eligible:
             skipped.append({"reason": "no eligible machines", "so_number": so_number})
             continue
+
+        # Lock to specific machine if picked/in-progress
+        if locked_machine and locked_machine in eligible:
+            eligible = [locked_machine]
 
         job = {
             "so_number": so_number,
@@ -245,6 +263,7 @@ def load_jobs_from_excel(path: str, cfg: SchedulerConfig) -> tuple[list[dict], l
             "priority_str": priority_str,
             "is_picked": is_picked,
             "is_in_progress": is_in_progress,
+            "locked_machine": locked_machine,
             "order_entry_date": raw.get("order_entry_date"),
             "eligible_machines": eligible,
         }

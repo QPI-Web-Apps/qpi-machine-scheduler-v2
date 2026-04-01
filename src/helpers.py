@@ -35,12 +35,12 @@ def infer_station_group(eqp_code: str) -> Optional[str]:
 
 
 _MACHINE_PATTERNS: list[tuple[str, str]] = [
-    (r"16S-A|16A", "16A"),
-    (r"16S-B|16B", "16B"),
-    (r"16S-C|16C", "16C"),
+    (r"16S[T]?-A|16A", "16A"),
+    (r"16S[T]?-B|16B", "16B"),
+    (r"16S[T]?-C|16C", "16C"),
     (r"20S", "20"),
-    (r"8ST", "8"),
-    (r"6ST", "6ST"),
+    (r"(?<!\d)8ST", "8"),
+    (r"(?<!\d)6ST", "6ST"),
     (r"\bLMB\b", "LMB"),
     (r"\bSMB\b", "SMB"),
     (r"\bRF\b", "RF"),
@@ -55,7 +55,7 @@ def infer_machine_from_eqp(eqp_code: str) -> Optional[str]:
     for pattern, machine_id in _MACHINE_PATTERNS:
         if re.search(pattern, eqp_code, re.IGNORECASE):
             # For 16-group, only return specific machine if the code is specific
-            if machine_id.startswith("16") and not re.search(r"16S-[ABC]|16[ABC]", eqp_code, re.IGNORECASE):
+            if machine_id.startswith("16") and not re.search(r"16S[T]?-[ABC]|16[ABC]", eqp_code, re.IGNORECASE):
                 return None
             return machine_id
     return None
@@ -94,7 +94,8 @@ class PriorityTier(IntEnum):
 
 
 class PriorityClass(IntEnum):
-    PRIORITY_PLUS = 0
+    IN_PROGRESS = -1   # Currently running on machine
+    PRIORITY_PLUS = 0  # P+ or picked jobs
     PRIORITY = 1
     PAST_DUE = 2
     NORMAL = 3

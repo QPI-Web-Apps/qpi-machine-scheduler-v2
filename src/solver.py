@@ -30,6 +30,7 @@ class ToolBatch:
     jobs: list[dict]
     total_minutes: int  # staffed minutes
     changeover_minutes: int  # cost to switch TO this batch's tool (0 if first or same tool)
+    has_in_progress: bool = False  # True if any job is currently running
 
     @property
     def total_hours(self) -> float:
@@ -151,7 +152,9 @@ def build_tool_batches(
             total_hrs = sum(j["run_hours"] for j in tool_jobs)
             total_min = max(1, round(total_hrs * 60))
 
-            co_min = round(spec.changeover_hours * 60) if spec.has_changeovers else 0
+            has_ip = any(j.get("is_in_progress") for j in tool_jobs)
+            # In-progress batches: no changeover (already running)
+            co_min = 0 if has_ip else (round(spec.changeover_hours * 60) if spec.has_changeovers else 0)
 
             batches.append(ToolBatch(
                 batch_id=batch_id,
@@ -160,6 +163,7 @@ def build_tool_batches(
                 jobs=tool_jobs,
                 total_minutes=total_min,
                 changeover_minutes=co_min,
+                has_in_progress=has_ip,
             ))
             batch_id += 1
 
@@ -205,6 +209,11 @@ def solve_schedule(
         starts[b.batch_id] = s
         ends[b.batch_id] = e
         intervals[b.batch_id] = iv
+
+    # ── Pin in-progress batches to start at minute 0 ─────────
+    for b in batches:
+        if b.has_in_progress:
+            model.add(starts[b.batch_id] == 0)
 
     # ── No-overlap per machine + changeover gaps ────────────────
 

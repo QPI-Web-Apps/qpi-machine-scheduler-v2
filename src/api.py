@@ -58,6 +58,8 @@ def _result_to_json(result: ScheduleResult, cfg: SchedulerConfig) -> dict:
                 "ticket_color": e.job_data.get("ticket_color", ""),
                 "is_labeler": e.job_data.get("is_labeler", False),
                 "is_bagger": e.job_data.get("is_bagger", False),
+                "is_picked": e.job_data.get("is_picked", False),
+                "is_in_progress": e.job_data.get("is_in_progress", False),
             })
         if e.entry_type == "NOT_RUNNING":
             entry["idle_type"] = e.idle_type
