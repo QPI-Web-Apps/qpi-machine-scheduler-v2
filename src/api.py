@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import uuid
 from datetime import datetime
@@ -81,7 +82,7 @@ def _result_to_json(result: ScheduleResult, cfg: SchedulerConfig) -> dict:
 
     for mid in sorted(by_machine):
         entries = by_machine[mid]
-        spd = cfg.shifts_per_day.get(mid, 2)
+        spd = cfg.get_day_shift_map(mid)
         jobs = [e for e in entries if e.entry_type == "JOB"]
         cos = [e for e in entries if e.entry_type in ("CHANGEOVER", "TOOL_SWAP")]
         # Only count idle when crew is present but has no work (IDLE_CREW type)
@@ -155,6 +156,7 @@ async def create_schedule(
     include_yellow: bool = Form(default=False),
     include_pink: bool = Form(default=False),
     include_white: bool = Form(default=False),
+    shift_config: str = Form(default=""),
 ):
     """Upload Excel, generate schedule, return JSON."""
     # Parse reference date/time
@@ -173,6 +175,18 @@ async def create_schedule(
         include_pink=include_pink,
         include_white=include_white,
     )
+
+    # Parse per-machine-per-day shift config if provided
+    if shift_config:
+        try:
+            cfg.shift_schedule = json.loads(shift_config)
+            print(f"[shift_config] Received config for {len(cfg.shift_schedule)} machines")
+            for mid, days in cfg.shift_schedule.items():
+                off_days = [d for d, s in days.items() if not s]
+                if off_days:
+                    print(f"  {mid}: OFF on {off_days}")
+        except json.JSONDecodeError:
+            print("[shift_config] Failed to parse JSON")
 
     # Save uploaded file temporarily
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:

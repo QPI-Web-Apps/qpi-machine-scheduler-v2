@@ -31,6 +31,9 @@ class SchedulerConfig:
         "16A": 2, "16B": 2, "16C": 2, "20": 2, "8": 2,
         "LMB": 2, "SMB": 2, "6ST": 2, "RF": 2,
     })
+    # Per-machine-per-day shift selection: machine_id -> date_str -> [shift_numbers]
+    # Empty dict = use shifts_per_day fallback
+    shift_schedule: dict[str, dict[str, list[int]]] = field(default_factory=dict)
     include_yellow: bool = False
     include_pink: bool = False
     include_white: bool = False
@@ -42,6 +45,12 @@ class SchedulerConfig:
     min_remaining_shift_hours: float = 1.0
     h3_enabled: bool = True
     initial_tools: dict[str, str] = field(default_factory=dict)
+
+    def get_day_shift_map(self, machine_id: str):
+        """Return per-day shift map for a machine, or int fallback."""
+        if machine_id in self.shift_schedule and self.shift_schedule[machine_id]:
+            return self.shift_schedule[machine_id]
+        return self.shifts_per_day.get(machine_id, 2)
 
 
 # ── Job dict structure ──────────────────────────────────────────────

@@ -119,7 +119,7 @@ def _assemble_schedule(
     for machine_id, m_batches in by_machine.items():
         m_batches.sort(key=lambda sb: sb.start_minute)
         spec = MACHINE_BY_ID[machine_id]
-        spd = cfg.shifts_per_day.get(machine_id, 2)
+        spd = cfg.get_day_shift_map(machine_id)
         prev_tool: Optional[str] = None
         prev_end: Optional[datetime] = None
 
@@ -189,7 +189,7 @@ def _assemble_schedule(
 
 
 def _staffed_minute_to_datetime(
-    minute: int, schedule_start: datetime, shifts_per_day: int
+    minute: int, schedule_start: datetime, shifts_per_day
 ) -> datetime:
     """Convert a staffed-minutes offset to a real datetime."""
     return add_staffed_hours(schedule_start, minute / 60.0, shifts_per_day)

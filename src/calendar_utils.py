@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
-from typing import Optional
+from typing import Optional, Union
 
 
 # ── Shift constants ─────────────────────────────────────────────────
@@ -24,6 +24,10 @@ _SHIFT_DEFS = [
     (SHIFT3_START, SHIFT3_END, True),    # shift 3: 22:30–06:30+1
 ]
 
+# ShiftConfig: int (legacy: first N shifts on weekdays) or dict (per-day)
+# dict format: {"YYYY-MM-DD": [1,2], ...} — active 1-based shift numbers per date
+ShiftConfig = Union[int, dict[str, list[int]]]
+
 
 # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -31,13 +35,24 @@ def _is_working_day(d: date) -> bool:
     return d.weekday() < 5  # Mon–Fri
 
 
-def _segments_for_day(d: date, shifts_per_day: int) -> list[tuple[datetime, datetime]]:
-    """Return (start, end) datetime pairs for each shift on calendar date *d*."""
-    if not _is_working_day(d):
-        return []
+def _resolve_shifts(d: date, shifts_per_day: ShiftConfig) -> list[int]:
+    """Return sorted list of active 1-based shift indices for date d."""
+    if isinstance(shifts_per_day, int):
+        if not _is_working_day(d):
+            return []
+        return list(range(1, min(shifts_per_day, 3) + 1))
+    default = [1, 2] if _is_working_day(d) else []
+    return sorted(shifts_per_day.get(d.isoformat(), default))
+
+
+def _segments_for_day(d: date, shifts_per_day: ShiftConfig) -> list[tuple[datetime, datetime]]:
+    """Return (start, end) datetime pairs for each active shift on calendar date *d*."""
+    active = _resolve_shifts(d, shifts_per_day)
     segs = []
-    for i in range(min(shifts_per_day, 3)):
-        s_start, s_end, crosses = _SHIFT_DEFS[i]
+    for shift_num in active:
+        if shift_num < 1 or shift_num > 3:
+            continue
+        s_start, s_end, crosses = _SHIFT_DEFS[shift_num - 1]
         seg_start = datetime.combine(d, s_start)
         seg_end = datetime.combine(d + timedelta(days=1) if crosses else d, s_end)
         segs.append((seg_start, seg_end))
@@ -51,22 +66,48 @@ def _next_working_day(d: date) -> date:
     return d
 
 
+def _next_active_day(d: date, shifts_per_day: ShiftConfig) -> date:
+    """Find the next day (after d) with at least one active shift."""
+    if isinstance(shifts_per_day, int):
+        return _next_working_day(d)
+    for _ in range(400):
+        d = d + timedelta(days=1)
+        if _resolve_shifts(d, shifts_per_day):
+            return d
+    return d  # fallback
+
+
+def _first_shift_start(d: date, shifts_per_day: ShiftConfig) -> time:
+    """Start time of the first active shift on date d. Falls back to S1."""
+    active = _resolve_shifts(d, shifts_per_day)
+    if not active:
+        return _SHIFT_DEFS[0][0]
+    return _SHIFT_DEFS[active[0] - 1][0]
+
+
 # ── Public API ──────────────────────────────────────────────────────
 
-def which_shift(t: datetime, shifts_per_day: int) -> Optional[int]:
+def which_shift(t: datetime, shifts_per_day: ShiftConfig) -> Optional[int]:
     """Return 1-based shift number for time *t*, or None if outside shifts."""
-    for i in range(min(shifts_per_day, 3)):
-        s_start, s_end, crosses = _SHIFT_DEFS[i]
+    active = _resolve_shifts(t.date(), shifts_per_day)
+    for i in active:
+        s_start, s_end, crosses = _SHIFT_DEFS[i - 1]
         if crosses:
             if t.time() >= s_start or t.time() < s_end:
-                return i + 1
+                return i
         else:
             if s_start <= t.time() < s_end:
-                return i + 1
+                return i
+    # Check if we're in the after-midnight portion of previous day's shift 3
+    if t.time() < SHIFT3_END:
+        prev = t.date() - timedelta(days=1)
+        prev_active = _resolve_shifts(prev, shifts_per_day)
+        if 3 in prev_active:
+            return 3
     return None
 
 
-def shift_key(cursor: datetime, shifts_per_day: int) -> tuple[date, int]:
+def shift_key(cursor: datetime, shifts_per_day: ShiftConfig) -> tuple[date, int]:
     """(calendar_date, shift_number).  Shift 3 is attributed to the evening date."""
     s = which_shift(cursor, shifts_per_day)
     if s is None:
@@ -79,17 +120,19 @@ def shift_key(cursor: datetime, shifts_per_day: int) -> tuple[date, int]:
     return (d, s)
 
 
-def align_to_working_time(cursor: datetime, shifts_per_day: int) -> datetime:
+def align_to_working_time(cursor: datetime, shifts_per_day: ShiftConfig) -> datetime:
     """Snap *cursor* forward to the next staffed moment."""
-    if shifts_per_day <= 0:
+    if isinstance(shifts_per_day, int) and shifts_per_day <= 0:
         return _DONE
 
     max_iter = 400
     d = cursor.date()
+
     # Handle after-midnight portion of shift 3 from previous day
-    if shifts_per_day >= 3 and cursor.time() < SHIFT3_END:
+    if cursor.time() < SHIFT3_END:
         prev = d - timedelta(days=1)
-        if _is_working_day(prev):
+        prev_active = _resolve_shifts(prev, shifts_per_day)
+        if 3 in prev_active:
             seg_start = datetime.combine(prev, SHIFT3_START)
             seg_end = datetime.combine(d, SHIFT3_END)
             if seg_start <= cursor < seg_end:
@@ -102,13 +145,13 @@ def align_to_working_time(cursor: datetime, shifts_per_day: int) -> datetime:
                 return seg_start
             if seg_start <= cursor < seg_end:
                 return cursor
-        d = _next_working_day(d)
-        cursor = datetime.combine(d, _SHIFT_DEFS[0][0])
+        d = _next_active_day(d, shifts_per_day)
+        cursor = datetime.combine(d, _first_shift_start(d, shifts_per_day))
 
     return _DONE
 
 
-def next_shift_start(t: datetime, shifts_per_day: int) -> datetime:
+def next_shift_start(t: datetime, shifts_per_day: ShiftConfig) -> datetime:
     """Find the start of the next shift strictly after time *t*."""
     max_iter = 14
     d = t.date()
@@ -117,11 +160,11 @@ def next_shift_start(t: datetime, shifts_per_day: int) -> datetime:
         for seg_start, _seg_end in segs:
             if seg_start > t:
                 return seg_start
-        d = _next_working_day(d)
+        d = _next_active_day(d, shifts_per_day)
     return _DONE
 
 
-def shift_end_for_time(t: datetime, shifts_per_day: int) -> Optional[datetime]:
+def shift_end_for_time(t: datetime, shifts_per_day: ShiftConfig) -> Optional[datetime]:
     """End of the shift that contains *t*, or None."""
     d = t.date()
     segs = _segments_for_day(d, shifts_per_day)
@@ -129,9 +172,10 @@ def shift_end_for_time(t: datetime, shifts_per_day: int) -> Optional[datetime]:
         if seg_start <= t < seg_end:
             return seg_end
     # Check previous day's shift 3
-    if shifts_per_day >= 3 and t.time() < SHIFT3_END:
+    if t.time() < SHIFT3_END:
         prev = d - timedelta(days=1)
-        if _is_working_day(prev):
+        prev_active = _resolve_shifts(prev, shifts_per_day)
+        if 3 in prev_active:
             seg_end = datetime.combine(d, SHIFT3_END)
             seg_start = datetime.combine(prev, SHIFT3_START)
             if seg_start <= t < seg_end:
@@ -140,7 +184,7 @@ def shift_end_for_time(t: datetime, shifts_per_day: int) -> Optional[datetime]:
 
 
 def add_staffed_hours(
-    start: datetime, hours: float, shifts_per_day: int
+    start: datetime, hours: float, shifts_per_day: ShiftConfig
 ) -> datetime:
     """Advance *start* by *hours* of staffed time, skipping gaps and weekends.
 
@@ -167,14 +211,14 @@ def add_staffed_hours(
                 return effective_start + timedelta(hours=remaining)
             remaining -= available
             cursor = seg_end
-        d = _next_working_day(d)
-        cursor = datetime.combine(d, _SHIFT_DEFS[0][0])
+        d = _next_active_day(d, shifts_per_day)
+        cursor = datetime.combine(d, _first_shift_start(d, shifts_per_day))
 
     return _DONE
 
 
 def staffed_hours_between(
-    start: datetime, end: datetime, shifts_per_day: int
+    start: datetime, end: datetime, shifts_per_day: ShiftConfig
 ) -> float:
     """Compute working hours between two datetimes."""
     if start >= end:
@@ -194,6 +238,6 @@ def staffed_hours_between(
             effective_end = min(end, seg_end)
             if effective_start < effective_end:
                 total += (effective_end - effective_start).total_seconds() / 3600.0
-        d = _next_working_day(d)
+        d = _next_active_day(d, shifts_per_day)
 
     return total

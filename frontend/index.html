@@ -387,6 +387,83 @@ table.data-table td { font-variant-numeric: tabular-nums; }
 
 .day-summary-card .ds-label { font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.04em; }
 .day-summary-card .ds-value { font-size: 15px; font-weight: 700; margin-top: 2px; }
+
+/* ── Shift Config Grid ─────────────────────────────────── */
+.shift-config-panel {
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  padding: 12px 24px; overflow-x: auto;
+}
+
+.shift-config-panel.collapsed .shift-grid { display: none; }
+
+.shift-config-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.shift-config-header h3 { font-size: 14px; font-weight: 600; }
+
+.shift-config-actions { display: flex; gap: 8px; }
+
+.shift-grid {
+  display: grid;
+  grid-template-columns: 56px repeat(14, 1fr);
+  gap: 1px; background: var(--border); border-radius: 6px; overflow: hidden;
+  min-width: 700px;
+}
+
+.shift-grid > div { background: var(--surface); padding: 4px; }
+
+.sg-corner { background: var(--surface2) !important; }
+
+.sg-col-header {
+  background: var(--surface2) !important; text-align: center;
+  font-size: 9px; color: var(--text-dim); line-height: 1.3;
+  padding: 4px 2px !important; cursor: pointer;
+}
+
+.sg-col-header:hover { color: var(--text); }
+
+.sg-col-header .sg-dow { font-weight: 600; }
+.sg-col-header .sg-date { opacity: 0.7; }
+
+.sg-row-header {
+  background: var(--surface2) !important;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700; color: var(--text-dim);
+  cursor: pointer;
+}
+
+.sg-row-header:hover { color: var(--text); }
+
+.sg-cell {
+  display: flex; gap: 2px; align-items: center; justify-content: center;
+  min-height: 28px;
+}
+
+.sg-cell.weekend { background: var(--surface2) !important; }
+
+.sg-pill {
+  width: 18px; height: 18px; border-radius: 4px;
+  border: 1px solid var(--border); background: transparent;
+  color: var(--text-dim); font-size: 9px; font-weight: 600;
+  cursor: pointer; display: flex; align-items: center; justify-content: center;
+  transition: all 0.12s; padding: 0;
+}
+
+.sg-pill:hover { border-color: var(--accent); }
+
+.sg-pill.active {
+  background: var(--accent); border-color: var(--accent); color: white;
+}
+
+/* Popover for row/column quick-fill */
+.sg-popover {
+  position: absolute; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px; display: flex; gap: 4px; z-index: 100;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+}
 </style>
 </head>
 <body>
@@ -403,9 +480,21 @@ table.data-table td { font-variant-numeric: tabular-nums; }
     <button class="upload-btn" onclick="document.getElementById('fileInput').click()">Choose Excel</button>
     <input type="file" id="fileInput" accept=".xlsx,.xls">
     <span class="file-name" id="fileName"></span>
+    <button class="day-btn" onclick="toggleShiftPanel()">Shifts</button>
     <button class="run-btn" id="runBtn" disabled onclick="runSchedule()">Generate Schedule</button>
   </div>
 </header>
+
+<div class="shift-config-panel collapsed" id="shiftConfigPanel">
+  <div class="shift-config-header">
+    <h3>Shift Configuration</h3>
+    <div class="shift-config-actions">
+      <button class="day-btn" onclick="resetShiftDefaults()">Reset Defaults</button>
+      <button class="day-btn" onclick="toggleShiftPanel()">Collapse</button>
+    </div>
+  </div>
+  <div class="shift-grid" id="shiftGrid"></div>
+</div>
 
 <div class="stats-bar" id="statsBar" style="display:none;">
   <div class="stat-card"><div class="label">Status</div><div class="value green" id="statStatus">-</div></div>
@@ -502,6 +591,10 @@ const SHIFT1_END_H = 14.5;   // 14:30
 const SHIFT2_END_H = 22.5;   // 22:30
 const DAY_HOURS = SHIFT2_END_H - SHIFT1_START_H; // 16h total
 
+// Shift config: machine_id -> { "YYYY-MM-DD": [1,2], ... }
+let shiftConfig = {};
+let shiftGridDays = []; // 14 Date objects for the grid columns
+
 // ── File handling ──────────────────────────────────────
 document.getElementById('fileInput').addEventListener('change', (e) => {
   selectedFile = e.target.files[0];
@@ -510,6 +603,135 @@ document.getElementById('fileInput').addEventListener('change', (e) => {
 });
 
 document.getElementById('refDate').value = new Date().toISOString().split('T')[0];
+document.getElementById('refDate').addEventListener('change', initShiftGrid);
+
+// ── Shift Config Grid ─────────────────────────────────
+function localDateStr(d) {
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+}
+
+function initShiftGrid() {
+  const dateVal = document.getElementById('refDate').value;
+  if (!dateVal) return;
+  const start = new Date(dateVal + 'T12:00:00'); // noon to avoid timezone issues
+
+  shiftGridDays = [];
+  for (let i = 0; i < 14; i++) {
+    const d = new Date(start);
+    d.setDate(d.getDate() + i);
+    shiftGridDays.push(d);
+  }
+
+  // Init config with defaults (weekday=[1,2], weekend=[])
+  shiftConfig = {};
+  MACHINE_ORDER.forEach(mid => {
+    shiftConfig[mid] = {};
+    shiftGridDays.forEach(d => {
+      const key = localDateStr(d);
+      const dow = d.getDay(); // 0=Sun, 6=Sat
+      shiftConfig[mid][key] = (dow === 0 || dow === 6) ? [] : [1, 2];
+    });
+  });
+
+  renderShiftGrid();
+}
+
+function renderShiftGrid() {
+  const grid = document.getElementById('shiftGrid');
+  const dows = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  let html = '';
+
+  // Corner cell
+  html += '<div class="sg-corner">Machine</div>';
+
+  // Column headers (days)
+  shiftGridDays.forEach(d => {
+    const key = localDateStr(d);
+    const dow = d.getDay();
+    const isWe = dow === 0 || dow === 6;
+    html += `<div class="sg-col-header${isWe ? ' weekend' : ''}" onclick="quickFillCol('${key}')">`;
+    html += `<div class="sg-dow">${dows[dow]}</div>`;
+    html += `<div class="sg-date">${d.getMonth()+1}/${d.getDate()}</div>`;
+    html += '</div>';
+  });
+
+  // Machine rows
+  MACHINE_ORDER.forEach(mid => {
+    html += `<div class="sg-row-header" onclick="quickFillRow('${mid}')">${mid}</div>`;
+    shiftGridDays.forEach(d => {
+      const key = localDateStr(d);
+      const dow = d.getDay();
+      const isWe = dow === 0 || dow === 6;
+      const active = shiftConfig[mid][key] || [];
+      html += `<div class="sg-cell${isWe ? ' weekend' : ''}">`;
+      for (let s = 1; s <= 3; s++) {
+        const on = active.includes(s);
+        html += `<button class="sg-pill${on ? ' active' : ''}" onclick="togglePill('${mid}','${key}',${s})">${s}</button>`;
+      }
+      html += '</div>';
+    });
+  });
+
+  grid.innerHTML = html;
+}
+
+function togglePill(mid, dateStr, shift) {
+  const arr = shiftConfig[mid][dateStr] || [];
+  const idx = arr.indexOf(shift);
+  if (idx >= 0) arr.splice(idx, 1);
+  else arr.push(shift);
+  arr.sort();
+  shiftConfig[mid][dateStr] = arr;
+  renderShiftGrid();
+}
+
+function toggleShiftPanel() {
+  document.getElementById('shiftConfigPanel').classList.toggle('collapsed');
+}
+
+function resetShiftDefaults() {
+  MACHINE_ORDER.forEach(mid => {
+    shiftGridDays.forEach(d => {
+      const key = localDateStr(d);
+      const dow = d.getDay();
+      shiftConfig[mid][key] = (dow === 0 || dow === 6) ? [] : [1, 2];
+    });
+  });
+  renderShiftGrid();
+}
+
+function quickFillRow(mid) {
+  // Cycle: current → all 3 shifts → clear → default (1,2)
+  const firstKey = shiftGridDays[0].toISOString().split('T')[0];
+  const current = shiftConfig[mid][firstKey] || [];
+  let next;
+  if (current.length === 2 && current[0] === 1 && current[1] === 2) next = [1,2,3];
+  else if (current.length === 3) next = [];
+  else next = [1,2];
+
+  shiftGridDays.forEach(d => {
+    const key = localDateStr(d);
+    shiftConfig[mid][key] = [...next];
+  });
+  renderShiftGrid();
+}
+
+function quickFillCol(dateStr) {
+  // Cycle based on first machine's value
+  const current = shiftConfig[MACHINE_ORDER[0]][dateStr] || [];
+  let next;
+  if (current.length === 2 && current[0] === 1 && current[1] === 2) next = [1,2,3];
+  else if (current.length === 3) next = [];
+  else next = [1,2];
+
+  MACHINE_ORDER.forEach(mid => {
+    shiftConfig[mid][dateStr] = [...next];
+  });
+  renderShiftGrid();
+}
+
+// Init grid on page load
+initShiftGrid();
 
 // ── Tabs ───────────────────────────────────────────────
 document.querySelectorAll('.tab').forEach(tab => {
@@ -537,6 +759,7 @@ async function runSchedule() {
   formData.append('reference_date', document.getElementById('refDate').value);
   formData.append('reference_time', document.getElementById('refTime').value);
   formData.append('max_concurrent', document.getElementById('maxConcurrent').value);
+  formData.append('shift_config', JSON.stringify(shiftConfig));
 
   try {
     const resp = await fetch('/api/schedule', { method: 'POST', body: formData });
@@ -577,9 +800,9 @@ function computeDays() {
   const daySet = new Set();
   scheduleData.schedule.forEach(e => {
     const d = new Date(e.start);
-    daySet.add(d.toISOString().split('T')[0]);
+    daySet.add(localDateStr(d));
     const d2 = new Date(e.end);
-    daySet.add(d2.toISOString().split('T')[0]);
+    daySet.add(localDateStr(d2));
   });
   scheduleDays = Array.from(daySet).sort().map(s => new Date(s + 'T00:00:00'));
 }
@@ -590,6 +813,17 @@ function changeDay(delta) {
 }
 
 // ── Day Gantt Rendering ────────────────────────────────
+function dayHasShift3() {
+  // Only show S3 view if a machine explicitly has shift 3 enabled in the config
+  if (!scheduleDays.length) return false;
+  const dateStr = localDateStr(scheduleDays[currentDayIndex]);
+  for (const mid of MACHINE_ORDER) {
+    const mc = shiftConfig[mid];
+    if (mc && mc[dateStr] && mc[dateStr].includes(3)) return true;
+  }
+  return false;
+}
+
 function renderDay() {
   if (!scheduleDays.length) return;
   const day = scheduleDays[currentDayIndex];
@@ -600,9 +834,17 @@ function renderDay() {
   document.getElementById('prevDay').disabled = currentDayIndex === 0;
   document.getElementById('nextDay').disabled = currentDayIndex === scheduleDays.length - 1;
 
-  // Day boundaries: 06:30 to 22:30
+  // Determine if S3 is active: extend view to 06:30 next day (24h)
+  const hasS3 = dayHasShift3();
+  const totalHours = hasS3 ? 24 : 16; // 24h or 16h view
+
   const dayStart = new Date(day); dayStart.setHours(6, 30, 0, 0);
-  const dayEnd = new Date(day); dayEnd.setHours(22, 30, 0, 0);
+  const dayEnd = new Date(day);
+  if (hasS3) {
+    dayEnd.setDate(dayEnd.getDate() + 1); dayEnd.setHours(6, 30, 0, 0);
+  } else {
+    dayEnd.setHours(22, 30, 0, 0);
+  }
   const dayStartMs = dayStart.getTime();
   const dayEndMs = dayEnd.getTime();
 
@@ -630,16 +872,19 @@ function renderDay() {
   html += '<div class="machine-col"></div>';
   html += '<div class="shift-col">Shift 1 (06:30 - 14:30)</div>';
   html += '<div class="shift-col">Shift 2 (14:30 - 22:30)</div>';
+  if (hasS3) html += '<div class="shift-col">Shift 3 (22:30 - 06:30)</div>';
   html += '</div>';
 
   // Time ruler
   html += '<div class="time-ruler">';
   html += '<div class="machine-col"></div>';
   html += '<div class="shift-track" style="position:relative;">';
-  for (let h = 7; h <= 22; h++) {
-    const pct = ((h - SHIFT1_START_H) / DAY_HOURS) * 100;
+  const rulerEnd = hasS3 ? 30.5 : 22; // 30.5 = 06:30 next day as hour offset
+  for (let h = 7; h <= (hasS3 ? 30 : 22); h++) {
+    const displayH = h > 24 ? h - 24 : h;
+    const pct = ((h - SHIFT1_START_H) / totalHours) * 100;
     if (pct >= 0 && pct <= 100) {
-      html += `<span class="hour-mark" style="left:${pct}%">${h}:00</span>`;
+      html += `<span class="hour-mark" style="left:${pct}%">${displayH}:00</span>`;
     }
   }
   html += '</div>';
@@ -651,26 +896,39 @@ function renderDay() {
   }
 
   activeMachines.forEach(mid => {
+    // Check if this specific machine has S3 on this day
+    const dateKey = localDateStr(day);
+    const machineShifts = (shiftConfig[mid] && shiftConfig[mid][dateKey]) || [1, 2];
+    const machineHasS3 = machineShifts.includes(3);
+
+    // Clip end for this machine: S3 machines go to 06:30 next day, others stop at 22:30
+    const s2End = new Date(day); s2End.setHours(22, 30, 0, 0);
+    const machineEndMs = machineHasS3 ? dayEndMs : s2End.getTime();
+
     html += '<div class="machine-row">';
     html += `<div class="machine-col">${mid}</div>`;
     html += '<div class="shift-track">';
 
     // Hour gridlines
-    for (let h = 7; h <= 22; h++) {
-      const pct = ((h - SHIFT1_START_H) / DAY_HOURS) * 100;
+    for (let h = 7; h <= (hasS3 ? 30 : 22); h++) {
+      const pct = ((h - SHIFT1_START_H) / totalHours) * 100;
       if (pct > 0 && pct < 100) {
         html += `<div class="hour-line" style="left:${pct}%"></div>`;
       }
     }
 
-    // Shift divider at 14:30
-    const shiftDivPct = ((SHIFT1_END_H - SHIFT1_START_H) / DAY_HOURS) * 100;
-    html += `<div class="shift-divider" style="left:${shiftDivPct}%"></div>`;
+    // Shift dividers at 14:30 and 22:30
+    const div1Pct = ((SHIFT1_END_H - SHIFT1_START_H) / totalHours) * 100;
+    html += `<div class="shift-divider" style="left:${div1Pct}%"></div>`;
+    if (hasS3) {
+      const div2Pct = ((SHIFT2_END_H - SHIFT1_START_H) / totalHours) * 100;
+      html += `<div class="shift-divider" style="left:${div2Pct}%"></div>`;
+    }
 
-    // Bars
+    // Bars — clip to this machine's shift boundary
     (byMachine[mid] || []).forEach(e => {
       const es = Math.max(new Date(e.start).getTime(), dayStartMs);
-      const ee = Math.min(new Date(e.end).getTime(), dayEndMs);
+      const ee = Math.min(new Date(e.end).getTime(), machineEndMs);
       if (ee <= es) return;
 
       const leftPct = ((es - dayStartMs) / (dayEndMs - dayStartMs)) * 100;
