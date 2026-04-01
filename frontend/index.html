@@ -13,19 +13,32 @@
 <body>
 
 <header>
-  <h1><span>QPI</span> Machine Scheduler</h1>
-  <div class="upload-area">
-    <label>Start Date:</label>
-    <input type="date" id="refDate">
-    <label>Start Time:</label>
-    <input type="time" id="refTime" value="06:30">
-    <label>Max machines:</label>
-    <input type="number" id="maxConcurrent" value="5" min="1" max="9">
-    <button class="upload-btn" onclick="document.getElementById('fileInput').click()">Choose Excel</button>
-    <input type="file" id="fileInput" accept=".xlsx,.xls">
-    <span class="file-name" id="fileName"></span>
+  <div class="header-top">
+    <h1><span>QPI</span> Machine Scheduler</h1>
+    <div class="header-file">
+      <button class="upload-btn" onclick="document.getElementById('fileInput').click()">Choose Excel</button>
+      <input type="file" id="fileInput" accept=".xlsx,.xls">
+      <span class="file-name" id="fileName"></span>
+      <button class="run-btn" id="runBtn" disabled onclick="runSchedule()">Generate</button>
+    </div>
+  </div>
+  <div class="header-controls">
+    <div class="control-group">
+      <label>Start</label>
+      <input type="date" id="refDate">
+      <input type="time" id="refTime" value="06:30">
+    </div>
+    <div class="control-group">
+      <label>Machines</label>
+      <input type="number" id="maxConcurrent" value="5" min="1" max="9">
+    </div>
+    <div class="control-group">
+      <label>Include</label>
+      <label class="ticket-toggle"><input type="checkbox" id="inclYellow"><span class="ticket-chip yellow">Yellow</span></label>
+      <label class="ticket-toggle"><input type="checkbox" id="inclPink"><span class="ticket-chip pink">Pink</span></label>
+      <label class="ticket-toggle"><input type="checkbox" id="inclWhite"><span class="ticket-chip white">White</span></label>
+    </div>
     <button class="day-btn" onclick="toggleShiftPanel()">Shifts</button>
-    <button class="run-btn" id="runBtn" disabled onclick="runSchedule()">Generate Schedule</button>
   </div>
 </header>
 
@@ -38,6 +51,10 @@
     </div>
   </div>
   <div class="shift-grid" id="shiftGrid"></div>
+  <div class="initial-tools" id="initialToolsRow">
+    <span class="it-label">Last tool on machine</span>
+    <div class="it-inputs" id="itInputs"></div>
+  </div>
 </div>
 
 <div class="stats-bar" id="statsBar" style="display:none;">
@@ -274,8 +291,28 @@ function quickFillCol(dateStr) {
   renderShiftGrid();
 }
 
+// ── Initial Tools ─────────────────────────────────────
+function renderInitialTools() {
+  const container = document.getElementById('itInputs');
+  let html = '';
+  MACHINE_ORDER.forEach(mid => {
+    html += `<div class="it-cell"><span class="it-mid">${mid}</span><input class="it-input" type="text" id="it_${mid}" placeholder="—"></div>`;
+  });
+  container.innerHTML = html;
+}
+
+function getInitialTools() {
+  const tools = {};
+  MACHINE_ORDER.forEach(mid => {
+    const val = document.getElementById('it_' + mid).value.trim();
+    if (val) tools[mid] = val;
+  });
+  return tools;
+}
+
 // Init grid on page load
 initShiftGrid();
+renderInitialTools();
 
 // ── Tabs ───────────────────────────────────────────────
 document.querySelectorAll('.tab').forEach(tab => {
@@ -304,6 +341,10 @@ async function runSchedule() {
   formData.append('reference_time', document.getElementById('refTime').value);
   formData.append('max_concurrent', document.getElementById('maxConcurrent').value);
   formData.append('shift_config', JSON.stringify(shiftConfig));
+  formData.append('include_yellow', document.getElementById('inclYellow').checked);
+  formData.append('include_pink', document.getElementById('inclPink').checked);
+  formData.append('include_white', document.getElementById('inclWhite').checked);
+  formData.append('initial_tools', JSON.stringify(getInitialTools()));
 
   try {
     const resp = await fetch('/api/schedule', { method: 'POST', body: formData });

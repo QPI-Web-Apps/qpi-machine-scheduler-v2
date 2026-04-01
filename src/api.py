@@ -159,6 +159,7 @@ async def create_schedule(
     include_pink: bool = Form(default=False),
     include_white: bool = Form(default=False),
     shift_config: str = Form(default=""),
+    initial_tools: str = Form(default=""),
 ):
     """Upload Excel, generate schedule, return JSON."""
     # Parse reference date/time
@@ -189,6 +190,12 @@ async def create_schedule(
                     print(f"  {mid}: OFF on {off_days}")
         except json.JSONDecodeError:
             print("[shift_config] Failed to parse JSON")
+
+    if initial_tools:
+        try:
+            cfg.initial_tools = json.loads(initial_tools)
+        except json.JSONDecodeError:
+            pass
 
     # Save uploaded file temporarily
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:

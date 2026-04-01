@@ -120,7 +120,7 @@ def _assemble_schedule(
         m_batches.sort(key=lambda sb: sb.start_minute)
         spec = MACHINE_BY_ID[machine_id]
         spd = cfg.get_day_shift_map(machine_id)
-        prev_tool: Optional[str] = None
+        prev_tool: Optional[str] = cfg.initial_tools.get(machine_id)
         prev_end: Optional[datetime] = None
 
         for sb in m_batches:
