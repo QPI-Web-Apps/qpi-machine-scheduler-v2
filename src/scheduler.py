@@ -245,10 +245,15 @@ def _compute_crew_movements(
             if e.entry_type != "JOB":
                 continue
             next_entry = m_entries[i + 1] if i + 1 < len(m_entries) else None
-            if next_entry is None or next_entry.entry_type in ("NOT_RUNNING", "TOOL_SWAP"):
+            if next_entry is None or next_entry.entry_type == "NOT_RUNNING":
                 hc = e.headcount or 0
                 if hc:
                     freed_events.append((e.end, machine_id, hc, "end_of_work", e))
+            elif next_entry.entry_type == "TOOL_SWAP":
+                # Self-service: crew does the swap themselves, freed after it completes
+                hc = e.headcount or 0
+                if hc:
+                    freed_events.append((next_entry.end, machine_id, hc, "end_of_work", next_entry))
 
     # ── Sort chronologically, then assign to nearest unclaimed target ─
     freed_events.sort(key=lambda ev: ev[0])
@@ -256,7 +261,14 @@ def _compute_crew_movements(
     used_sources: set[tuple[str, datetime]] = set()
     claimed_targets: set[tuple[str, datetime]] = set()
 
-    for freed_time, freed_machine, hc, reason, source_entry in freed_events:
+    for _freed_time_orig, freed_machine, hc, reason, source_entry in freed_events:
+        # Re-read freed_time from the source entry — earlier pushes may have
+        # shifted it forward (e.g. a TOOL_SWAP whose preceding JOB was pushed).
+        if source_entry:
+            freed_time = source_entry.start if reason == "changeover" else source_entry.end
+        else:
+            freed_time = _freed_time_orig
+
         if (freed_machine, freed_time) in used_sources:
             continue
 
@@ -271,6 +283,20 @@ def _compute_crew_movements(
             continue
 
         target = min(candidates, key=lambda e: abs((e.start - freed_time).total_seconds()))
+
+        # If crew arrives after the target job was supposed to start,
+        # push the target and subsequent entries forward so timing aligns.
+        if freed_time > target.start:
+            delta = freed_time - target.start
+            m_ents = by_machine[target.machine_id]
+            t_idx = m_ents.index(target)
+            for ent in m_ents[t_idx:]:
+                if ent.entry_type == "NOT_RUNNING":
+                    # NOT_RUNNING gap absorbs the delay: shift start only
+                    ent.start = ent.start + delta
+                    break
+                ent.start = ent.start + delta
+                ent.end = ent.end + delta
 
         if source_entry:
             source_entry.crew_to = target.machine_id
