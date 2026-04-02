@@ -21,7 +21,10 @@
       "mcp__playwright__browser_take_screenshot",
       "Bash(kill 6587)",
       "WebFetch(domain:d-krupke.github.io)",
-      "Bash(kill 7478)"
+      "Bash(kill 7478)",
+      "Bash(kill 9046)",
+      "Bash(kill 10381)",
+      "Bash(fuser -k 8000/tcp)"
     ]
   }
 }

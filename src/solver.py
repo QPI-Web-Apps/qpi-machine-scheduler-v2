@@ -77,15 +77,22 @@ def assign_jobs_to_machines(
 
     # Assign 16-group tools to machines via greedy load-balance
     if group_16_jobs:
-        _assign_16_group(group_16_jobs, machine_jobs)
+        _assign_16_group(group_16_jobs, machine_jobs,
+                         minimize_changeovers=cfg.priority_boost)
 
     return machine_jobs
 
 
 def _assign_16_group(
-    jobs: list[dict], machine_jobs: dict[str, list[dict]]
+    jobs: list[dict], machine_jobs: dict[str, list[dict]],
+    minimize_changeovers: bool = False,
 ) -> None:
-    """Assign 16-group tools to 16A/B/C, balancing total hours."""
+    """Assign 16-group tools to 16A/B/C, balancing total hours.
+
+    When minimize_changeovers is True, adding a new tool to a machine incurs
+    a virtual 2-hour penalty (matching the changeover cost), encouraging
+    consolidation of tools on fewer machines.
+    """
     # Group jobs by tool
     tool_jobs: dict[str, list[dict]] = {}
     for job in jobs:
@@ -102,19 +109,26 @@ def _assign_16_group(
     # Sort largest first for better load balance
     bundles.sort(key=lambda b: -b[1])
 
-    # Track load per machine
+    # Track load and tool count per machine
     load = {"16A": 0.0, "16B": 0.0, "16C": 0.0}
+    tools_on: dict[str, int] = {"16A": 0, "16B": 0, "16C": 0}
     # Add existing load from single-eligible jobs already assigned
     for mid in load:
         load[mid] = sum(j["run_hours"] for j in machine_jobs[mid])
+        tools_on[mid] = len(set(j["tool_id"] for j in machine_jobs[mid]))
+
+    changeover_hrs = 2.0  # 16-group changeover cost
 
     for tool_id, total_hrs, tjobs, eligible in bundles:
-        # Pick the least-loaded eligible machine
-        best = min(eligible, key=lambda m: load[m])
+        if minimize_changeovers:
+            best = min(eligible, key=lambda m: load[m] + changeover_hrs * tools_on[m])
+        else:
+            best = min(eligible, key=lambda m: load[m])
         for job in tjobs:
             job["assigned_machine"] = best
             machine_jobs[best].append(job)
         load[best] += total_hrs
+        tools_on[best] += 1
 
 
 # ── Stage 2: Build tool batches ─────────────────────────────────────
