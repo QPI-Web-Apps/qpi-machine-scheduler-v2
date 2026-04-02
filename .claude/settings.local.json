@@ -4,7 +4,22 @@
       "Bash(pip list:*)",
       "Bash(pip install:*)",
       "Bash(curl -s http://localhost:8000/api/health)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(ps:*)",
+      "Bash(kill 4708)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(npx playwright:*)",
+      "Bash(claude mcp:*)",
+      "Bash(uvicorn src.api:app:*)",
+      "mcp__playwright__browser_navigate",
+      "mcp__playwright__browser_snapshot",
+      "mcp__playwright__browser_click",
+      "mcp__playwright__browser_fill_form",
+      "mcp__playwright__browser_file_upload",
+      "mcp__playwright__browser_wait_for",
+      "mcp__playwright__browser_take_screenshot",
+      "Bash(kill 6587)"
     ]
   }
 }

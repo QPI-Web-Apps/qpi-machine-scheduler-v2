@@ -202,60 +202,90 @@ def _compute_crew_movements(
 ) -> list[CrewMovement]:
     """Walk the schedule chronologically and track crew movements.
 
-    When a machine enters CHANGEOVER, its crew is freed.
-    We find the next machine that starts a JOB around the same time
-    and annotate the crew bridge.
+    Crew is freed in two scenarios:
+    1. A CHANGEOVER starts — the operator is no longer needed on that machine.
+    2. A machine's last job ends with no follow-on work (no next job/changeover).
+
+    All freed-crew events are collected, sorted chronologically, then processed
+    in order so each crew claims the nearest *unclaimed* target job.
     """
     movements: list[CrewMovement] = []
-
-    # Collect changeover events (crew freed)
-    changeovers = [
-        e for e in entries if e.entry_type == "CHANGEOVER"
-    ]
 
     # Collect job starts for quick lookup
     job_starts = [
         e for e in entries if e.entry_type == "JOB"
     ]
 
-    for co in changeovers:
-        co_start = co.start
-        co_machine = co.machine_id
+    # ── Collect all "crew freed" events ──────────────────────────────
+    # Each event: (freed_time, freed_machine, headcount, reason, source_entry)
+    freed_events: list[tuple[datetime, str, float, str, Optional[ScheduleEntry]]] = []
 
-        # Find the headcount of the last job on this machine before changeover
+    # From changeovers
+    for co in entries:
+        if co.entry_type != "CHANGEOVER":
+            continue
         prev_jobs = [
             e for e in entries
-            if e.machine_id == co_machine
+            if e.machine_id == co.machine_id
             and e.entry_type == "JOB"
-            and e.end <= co_start + timedelta(minutes=5)
+            and e.end <= co.start + timedelta(minutes=5)
         ]
         hc = prev_jobs[-1].headcount if prev_jobs else 0
+        if hc:
+            freed_events.append((co.start, co.machine_id, hc, "changeover", co))
 
-        if not hc:
+    # From end-of-work (job followed by nothing, NOT_RUNNING, or TOOL_SWAP)
+    by_machine: dict[str, list[ScheduleEntry]] = {}
+    for e in entries:
+        by_machine.setdefault(e.machine_id, []).append(e)
+
+    for machine_id, m_entries in by_machine.items():
+        m_entries.sort(key=lambda e: e.start)
+        for i, e in enumerate(m_entries):
+            if e.entry_type != "JOB":
+                continue
+            next_entry = m_entries[i + 1] if i + 1 < len(m_entries) else None
+            if next_entry is None or next_entry.entry_type in ("NOT_RUNNING", "TOOL_SWAP"):
+                hc = e.headcount or 0
+                if hc:
+                    freed_events.append((e.end, machine_id, hc, "end_of_work", e))
+
+    # ── Sort chronologically, then assign to nearest unclaimed target ─
+    freed_events.sort(key=lambda ev: ev[0])
+
+    used_sources: set[tuple[str, datetime]] = set()
+    claimed_targets: set[tuple[str, datetime]] = set()
+
+    for freed_time, freed_machine, hc, reason, source_entry in freed_events:
+        if (freed_machine, freed_time) in used_sources:
             continue
 
-        # Find the best landing spot: a JOB starting on another machine
-        # within a window around the changeover start
         window = timedelta(hours=3)
         candidates = [
             e for e in job_starts
-            if e.machine_id != co_machine
-            and co_start - timedelta(minutes=30) <= e.start <= co_start + window
+            if e.machine_id != freed_machine
+            and freed_time - timedelta(minutes=30) <= e.start <= freed_time + window
+            and (e.machine_id, e.start) not in claimed_targets
         ]
+        if not candidates:
+            continue
 
-        if candidates:
-            # Pick the one starting closest to changeover time
-            target = min(candidates, key=lambda e: abs((e.start - co_start).total_seconds()))
+        target = min(candidates, key=lambda e: abs((e.start - freed_time).total_seconds()))
 
-            co.crew_to = target.machine_id
-            target.crew_from = co_machine
+        if source_entry:
+            source_entry.crew_to = target.machine_id
+        target.crew_from = freed_machine
 
-            movements.append(CrewMovement(
-                time=co_start,
-                from_machine=co_machine,
-                to_machine=target.machine_id,
-                headcount=hc,
-                reason="changeover",
-            ))
+        used_sources.add((freed_machine, freed_time))
+        claimed_targets.add((target.machine_id, target.start))
 
+        movements.append(CrewMovement(
+            time=freed_time,
+            from_machine=freed_machine,
+            to_machine=target.machine_id,
+            headcount=hc,
+            reason=reason,
+        ))
+
+    movements.sort(key=lambda m: m.time)
     return movements
