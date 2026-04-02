@@ -290,6 +290,9 @@ def _compute_crew_movements(
             delta = freed_time - target.start
             m_ents = by_machine[target.machine_id]
             t_idx = m_ents.index(target)
+            # Extend preceding NOT_RUNNING to fill the gap
+            if t_idx > 0 and m_ents[t_idx - 1].entry_type == "NOT_RUNNING":
+                m_ents[t_idx - 1].end = m_ents[t_idx - 1].end + delta
             for ent in m_ents[t_idx:]:
                 if ent.entry_type == "NOT_RUNNING":
                     # NOT_RUNNING gap absorbs the delay: shift start only
@@ -297,6 +300,10 @@ def _compute_crew_movements(
                     break
                 ent.start = ent.start + delta
                 ent.end = ent.end + delta
+
+        # Use actual job start as the movement time (crew may arrive
+        # slightly early and wait for the job to begin).
+        move_time = max(freed_time, target.start)
 
         if source_entry:
             source_entry.crew_to = target.machine_id
@@ -306,7 +313,7 @@ def _compute_crew_movements(
         claimed_targets.add((target.machine_id, target.start))
 
         movements.append(CrewMovement(
-            time=freed_time,
+            time=move_time,
             from_machine=freed_machine,
             to_machine=target.machine_id,
             headcount=hc,
