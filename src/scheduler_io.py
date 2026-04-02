@@ -39,6 +39,7 @@ class SchedulerConfig:
     include_pink: bool = False
     include_white: bool = False
     disabled_stations: list[str] = field(default_factory=list)
+    disabled_machines: list[str] = field(default_factory=list)
     hc_flex: int = 2
     crew_transition_flex: int = 1
     default_headcount: float = DEFAULT_HEADCOUNT
@@ -244,6 +245,13 @@ def load_jobs_from_excel(path: str, cfg: SchedulerConfig) -> tuple[list[dict], l
         # Lock to specific machine if picked/in-progress
         if locked_machine and locked_machine in eligible:
             eligible = [locked_machine]
+
+        # Remove disabled machines
+        if cfg.disabled_machines:
+            eligible = [m for m in eligible if m not in cfg.disabled_machines]
+            if not eligible:
+                skipped.append({"reason": "all eligible machines disabled", "so_number": so_number})
+                continue
 
         job = {
             "so_number": so_number,

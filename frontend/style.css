@@ -464,6 +464,26 @@ table.data-table tbody tr:hover { background: var(--accent-light); }
 .it-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
 .it-input::placeholder { color: var(--border); }
 
+/* Machine toggle panel */
+.machine-toggle-panel {
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  padding: 10px 16px; transition: all 0.2s;
+}
+.machine-toggle-panel.collapsed { display: none; }
+.mt-row { display: flex; gap: 6px; flex-wrap: wrap; }
+.mt-btn {
+  padding: 5px 14px; border-radius: 4px; font-size: 12px;
+  font-weight: 600; font-family: inherit; cursor: pointer;
+  border: 1px solid var(--border); transition: all 0.12s;
+}
+.mt-btn.on {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+.mt-btn.off {
+  background: transparent; border-color: #334155; color: #64748b;
+}
+.mt-btn.off:hover { border-color: #475569; color: #94a3b8; }
+
 .sg-popover {
   position: absolute; background: var(--surface);
   border: 1px solid var(--border); border-radius: 6px;

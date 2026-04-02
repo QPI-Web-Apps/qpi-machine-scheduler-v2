@@ -36,7 +36,11 @@
       "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8000/)",
       "Bash(curl -s -X POST http://localhost:8000/api/schedule -F 'schedule_file=@test_schedules/STF schduler 04.01.xlsx' -F reference_date=2026-04-01 -F reference_time=06:30 -F max_concurrent=3 -F include_yellow=true -F include_pink=true -F include_white=false -F 'shift_config={}' -F 'initial_tools={}' -F priority_boost=false -F minimize_late=false)",
       "Bash(ls /mnt/c/Users/abuba/OneDrive/Documents/GitHub/qpi-machine-scheduler-v2/*.py /mnt/c/Users/abuba/OneDrive/Documents/GitHub/qpi-machine-scheduler-v2/app.py /mnt/c/Users/abuba/OneDrive/Documents/GitHub/qpi-machine-scheduler-v2/main.py)",
-      "Bash(echo \"PID: $!\")"
+      "Bash(echo \"PID: $!\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8000/style.css)",
+      "Bash(curl -s http://localhost:8000/style.css)",
+      "mcp__playwright__browser_evaluate",
+      "mcp__playwright__browser_run_code"
     ]
   }
 }

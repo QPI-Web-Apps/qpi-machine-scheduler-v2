@@ -165,6 +165,7 @@ async def create_schedule(
     initial_tools: str = Form(default=""),
     priority_boost: bool = Form(default=False),
     minimize_late: bool = Form(default=False),
+    disabled_machines: str = Form(default=""),
 ):
     """Upload Excel, generate schedule, return JSON."""
     # Parse reference date/time
@@ -177,6 +178,14 @@ async def create_schedule(
     hour, minute = int(time_parts[0]), int(time_parts[1]) if len(time_parts) > 1 else 0
     schedule_start = datetime.combine(date_part, datetime.min.time().replace(hour=hour, minute=minute))
 
+    # Parse disabled machines
+    disabled_machines_list = []
+    if disabled_machines:
+        try:
+            disabled_machines_list = json.loads(disabled_machines)
+        except json.JSONDecodeError:
+            pass
+
     cfg = SchedulerConfig(
         schedule_start=schedule_start,
         include_yellow=include_yellow,
@@ -184,6 +193,7 @@ async def create_schedule(
         include_white=include_white,
         priority_boost=priority_boost,
         minimize_late=minimize_late,
+        disabled_machines=disabled_machines_list,
     )
 
     # Parse per-machine-per-day shift config if provided

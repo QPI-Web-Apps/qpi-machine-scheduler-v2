@@ -6,7 +6,7 @@
 <title>QPI Machine Scheduler</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="style.css?v=2">
 <style>/* styles in style.css */
 </style>
 </head>
@@ -42,8 +42,13 @@
     <label class="ticket-toggle"><input type="checkbox" id="prioBoost"><span class="ticket-chip boost">P+ Boost</span></label>
     <label class="ticket-toggle"><input type="checkbox" id="minimizeLate"><span class="ticket-chip late-mode">Min Late</span></label>
     <button class="day-btn" onclick="toggleShiftPanel()">Shifts</button>
+    <button class="day-btn" onclick="toggleMachinePanel()">Machines</button>
   </div>
 </header>
+
+<div class="machine-toggle-panel collapsed" id="machineTogglePanel">
+  <div class="mt-row" id="machineToggles"></div>
+</div>
 
 <div class="shift-config-panel collapsed" id="shiftConfigPanel">
   <div class="shift-config-header">
@@ -332,9 +337,37 @@ function getInitialTools() {
   return tools;
 }
 
+// ── Machine Toggles ──────────────────────────────────
+const enabledMachines = {};
+MACHINE_ORDER.forEach(mid => { enabledMachines[mid] = true; });
+
+function renderMachineToggles() {
+  const container = document.getElementById('machineToggles');
+  let html = '';
+  MACHINE_ORDER.forEach(mid => {
+    const on = enabledMachines[mid];
+    html += `<button class="mt-btn ${on ? 'on' : 'off'}" onclick="toggleMachine('${mid}')">${mid}</button>`;
+  });
+  container.innerHTML = html;
+}
+
+function toggleMachine(mid) {
+  enabledMachines[mid] = !enabledMachines[mid];
+  renderMachineToggles();
+}
+
+function toggleMachinePanel() {
+  document.getElementById('machineTogglePanel').classList.toggle('collapsed');
+}
+
+function getDisabledMachines() {
+  return MACHINE_ORDER.filter(mid => !enabledMachines[mid]);
+}
+
 // Init grid on page load
 initShiftGrid();
 renderInitialTools();
+renderMachineToggles();
 
 // ── Tabs ───────────────────────────────────────────────
 document.querySelectorAll('.tab').forEach(tab => {
@@ -370,6 +403,7 @@ async function runSchedule() {
   formData.append('initial_tools', JSON.stringify(getInitialTools()));
   formData.append('priority_boost', document.getElementById('prioBoost').checked);
   formData.append('minimize_late', document.getElementById('minimizeLate').checked);
+  formData.append('disabled_machines', JSON.stringify(getDisabledMachines()));
 
   try {
     const resp = await fetch('/api/schedule', { method: 'POST', body: formData });
