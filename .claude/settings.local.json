@@ -19,7 +19,9 @@
       "mcp__playwright__browser_file_upload",
       "mcp__playwright__browser_wait_for",
       "mcp__playwright__browser_take_screenshot",
-      "Bash(kill 6587)"
+      "Bash(kill 6587)",
+      "WebFetch(domain:d-krupke.github.io)",
+      "Bash(kill 7478)"
     ]
   }
 }

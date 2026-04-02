@@ -241,3 +241,16 @@ def staffed_hours_between(
         d = _next_active_day(d, shifts_per_day)
 
     return total
+
+
+def datetime_to_staffed_minute(
+    dt: datetime, schedule_start: datetime, shifts_per_day: ShiftConfig
+) -> int:
+    """Convert a datetime to a staffed-minute offset from schedule_start.
+
+    Returns 0 if dt is at or before schedule_start (already past due).
+    """
+    if dt <= schedule_start:
+        return 0
+    hours = staffed_hours_between(schedule_start, dt, shifts_per_day)
+    return round(hours * 60)

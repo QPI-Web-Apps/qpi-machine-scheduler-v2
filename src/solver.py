@@ -15,7 +15,7 @@ from typing import Optional
 
 from ortools.sat.python import cp_model
 
-from .calendar_utils import add_staffed_hours
+from .calendar_utils import add_staffed_hours, datetime_to_staffed_minute
 from .models import MACHINE_BY_ID, machines_in_group
 from .scheduler_io import SchedulerConfig
 
@@ -264,8 +264,51 @@ def solve_schedule(
 
     objective = makespan
 
+    # Minimize late jobs: count jobs finishing after their due date,
+    # with weighted tardiness to prefer less-late solutions at same count.
+    if cfg.minimize_late:
+        spd = cfg.get_day_shift_map("16A")  # default shift map for date conversion
+        late_vars = []
+        tardiness_vars = []
+
+        for b in batches:
+            cumulative_min = 0
+            for j_idx, job in enumerate(b.jobs):
+                job_run_min = max(1, round(job["run_hours"] * 60))
+                cumulative_min += job_run_min
+
+                due = job.get("due_date")
+                if not due or job.get("priority_class", 3) == 2:
+                    continue  # no due date or already past due
+
+                due_min = datetime_to_staffed_minute(due, cfg.schedule_start, spd)
+                if due_min <= 0:
+                    continue  # due before schedule start
+
+                # job end = batch start + cumulative run minutes
+                job_end = starts[b.batch_id] + cumulative_min
+
+                # Boolean: is this job late?
+                late_var = model.new_bool_var(f"late_{b.batch_id}_{j_idx}")
+                model.add(job_end > due_min).only_enforce_if(late_var)
+                model.add(job_end <= due_min).only_enforce_if(~late_var)
+                late_vars.append(late_var)
+
+                # Tardiness: how many minutes late (clamped to 0)
+                tardiness = model.new_int_var(0, horizon, f"tard_{b.batch_id}_{j_idx}")
+                model.add(tardiness >= job_end - due_min)
+                tardiness_vars.append(tardiness)
+
+        if late_vars:
+            late_count = sum(late_vars)
+            total_tardiness = sum(tardiness_vars)
+            # Hierarchy: fewer late >> less total tardiness >> shorter makespan
+            objective = (late_count * 10_000_000
+                         + total_tardiness * 100
+                         + makespan)
+
     # Priority boost: penalize late starts of priority batches
-    if cfg.priority_boost:
+    elif cfg.priority_boost:
         boost_terms = []
         for b in batches:
             min_prio = min((j.get("priority_class", 3) for j in b.jobs), default=3)
@@ -281,7 +324,8 @@ def solve_schedule(
     # ── Solve ───────────────────────────────────────────────────
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = time_limit_seconds
+    effective_limit = time_limit_seconds * 2 if cfg.minimize_late else time_limit_seconds
+    solver.parameters.max_time_in_seconds = effective_limit
     solver.parameters.num_workers = 8
 
     status = solver.solve(model)
