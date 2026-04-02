@@ -236,6 +236,25 @@ def solve_schedule(
     for b in batches:
         machine_batches.setdefault(b.machine_id, []).append(b)
 
+    # ── Initial tool changeover constraints ────────────────────
+    # If a machine has a known last tool, any first batch with a different
+    # tool must start after the changeover duration.
+    if cfg.initial_tools:
+        for machine_id, init_tool in cfg.initial_tools.items():
+            if machine_id not in machine_batches:
+                continue
+            m_batches_it = machine_batches[machine_id]
+            # Skip if machine has in-progress batch (already running)
+            if any(b.has_in_progress for b in m_batches_it):
+                continue
+            spec = MACHINE_BY_ID[machine_id]
+            if not spec.has_changeovers:
+                continue
+            co_min = round(spec.changeover_hours * 60)
+            for b in m_batches_it:
+                if b.tool_id != init_tool:
+                    model.add(starts[b.batch_id] >= co_min)
+
     # For each machine, add no-overlap and changeover constraints
     for machine_id, m_batches in machine_batches.items():
         if len(m_batches) <= 1:
@@ -332,6 +351,14 @@ def solve_schedule(
                 boost_terms.append(5 * starts[b.batch_id])
         if boost_terms:
             objective = makespan + sum(boost_terms)
+
+    # Always push picked batches early, regardless of mode
+    picked_terms = []
+    for b in batches:
+        if any(j.get("is_picked") for j in b.jobs) and not b.has_in_progress:
+            picked_terms.append(10 * starts[b.batch_id])
+    if picked_terms:
+        objective = objective + sum(picked_terms)
 
     model.minimize(objective)
 

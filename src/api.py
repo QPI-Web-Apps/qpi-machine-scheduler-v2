@@ -200,7 +200,16 @@ async def create_schedule(
 
     if initial_tools:
         try:
-            cfg.initial_tools = json.loads(initial_tools)
+            from .helpers import normalize_tool
+            raw_tools = json.loads(initial_tools)
+            cfg.initial_tools = {}
+            for mid, val in raw_tools.items():
+                val = str(val).strip()
+                if val:
+                    try:
+                        cfg.initial_tools[mid] = normalize_tool(val)
+                    except ValueError:
+                        cfg.initial_tools[mid] = val
         except json.JSONDecodeError:
             pass
 
