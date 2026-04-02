@@ -27,7 +27,13 @@
       "Bash(fuser -k 8000/tcp)",
       "Bash(ls /mnt/c/Users/abuba/OneDrive/Documents/GitHub/qpi-machine-scheduler-v2/requirements*.txt)",
       "Bash(pip freeze:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(lsof -ti:8000)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8000/docs)",
+      "Read(//tmp/**)",
+      "Bash(grep:*)",
+      "Bash(xargs -r kill -9)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8000/)"
     ]
   }
 }

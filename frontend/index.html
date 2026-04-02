@@ -77,6 +77,7 @@
   <div class="tab" data-tab="crew">Crew Movements</div>
   <div class="tab" data-tab="headcount">Headcount</div>
   <div class="tab" data-tab="jobs">All Jobs</div>
+  <div class="tab" data-tab="yelpink">Yellow & Pink</div>
 </div>
 
 <div class="content">
@@ -137,6 +138,21 @@
       <thead><tr>
         <th>SO #</th><th>Machine</th><th>Tool</th><th>Start</th><th>End</th>
         <th>Run Hrs</th><th>HC</th><th>Customer</th><th>Due Date</th><th>Priority</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <!-- Yellow & Pink Tab -->
+  <div class="tab-panel" id="panel-yelpink" style="display:none;">
+    <div style="display:flex;align-items:center;gap:16px;margin-bottom:12px;">
+      <div id="yelpinkCount" style="font-weight:600;font-size:1.05rem;"></div>
+      <button class="run-btn" onclick="exportYelPinkCSV()" style="padding:6px 16px;font-size:0.85rem;">Export CSV</button>
+    </div>
+    <table class="data-table" id="yelpinkTable">
+      <thead><tr>
+        <th>SO #</th><th>Part #</th><th>Description</th><th>Tool #</th>
+        <th>Machine</th><th>Due Date</th><th>Scheduled Start</th><th>Ticket Color</th><th>Type</th>
       </tr></thead>
       <tbody></tbody>
     </table>
@@ -408,6 +424,7 @@ function onScheduleLoaded() {
   renderCrewMovements();
   renderHeadcount();
   renderJobsTable();
+  renderYelPinkTable();
 }
 
 function computeDays() {
@@ -907,6 +924,79 @@ function renderJobsTable() {
     </tr>`;
   });
   tbody.innerHTML = html;
+}
+
+// ── Yellow & Pink Table ───────────────────────────────
+function renderYelPinkTable() {
+  const tbody = document.querySelector('#yelpinkTable tbody');
+  const jobs = scheduleData.schedule.filter(e =>
+    e.type === 'JOB' && e.ticket_color && /yellow|pink/i.test(e.ticket_color)
+  );
+  jobs.sort((a,b) => new Date(a.start) - new Date(b.start));
+
+  const yellowCount = jobs.filter(j => /yellow/i.test(j.ticket_color)).length;
+  const pinkCount = jobs.filter(j => /pink/i.test(j.ticket_color)).length;
+  const parts = [];
+  if (yellowCount) parts.push(yellowCount + ' yellow job' + (yellowCount !== 1 ? 's' : ''));
+  if (pinkCount) parts.push(pinkCount + ' pink job' + (pinkCount !== 1 ? 's' : ''));
+  document.getElementById('yelpinkCount').textContent = parts.join(', ') || 'No yellow/pink jobs';
+
+  let html = '';
+  jobs.forEach(j => {
+    const tags = [];
+    if (j.is_labeler) tags.push('Labeler');
+    if (j.is_bagger) tags.push('Bagger');
+    if (j.is_in_progress) tags.push('In Progress');
+    if (j.is_picked) tags.push('Picked');
+    const jobType = tags.length ? tags.join(', ') : 'Regular';
+    html += `<tr>
+      <td><strong>${j.so_number||'-'}</strong></td>
+      <td>${j.finished_item||'-'}</td>
+      <td>${j.description||'-'}</td>
+      <td>${j.tool_id||'-'}</td>
+      <td>${j.machine_id}</td>
+      <td>${j.due_date?fmtDt(j.due_date):'-'}</td>
+      <td>${fmtDt(j.start)}</td>
+      <td>${j.ticket_color||'-'}</td>
+      <td>${jobType}</td>
+    </tr>`;
+  });
+  tbody.innerHTML = html;
+}
+
+function exportYelPinkCSV() {
+  if (!scheduleData) return;
+  const jobs = scheduleData.schedule.filter(e =>
+    e.type === 'JOB' && e.ticket_color && /yellow|pink/i.test(e.ticket_color)
+  );
+  jobs.sort((a,b) => new Date(a.start) - new Date(b.start));
+
+  const esc = v => '"' + String(v||'').replace(/"/g,'""') + '"';
+  const jobType = j => {
+    const tags = [];
+    if (j.is_labeler) tags.push('Labeler');
+    if (j.is_bagger) tags.push('Bagger');
+    if (j.is_in_progress) tags.push('In Progress');
+    if (j.is_picked) tags.push('Picked');
+    return tags.length ? tags.join(', ') : 'Regular';
+  };
+  const rows = [['SO #','Part #','Description','Tool #','Machine','Due Date','Scheduled Start','Ticket Color','Type'].join(',')];
+  jobs.forEach(j => {
+    rows.push([
+      esc(j.so_number), esc(j.finished_item), esc(j.description),
+      esc(j.tool_id), esc(j.machine_id),
+      esc(j.due_date ? new Date(j.due_date).toLocaleDateString() : ''),
+      esc(j.start ? new Date(j.start).toLocaleString() : ''),
+      esc(j.ticket_color), esc(jobType(j))
+    ].join(','));
+  });
+
+  const blob = new Blob([rows.join('\n')], {type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'yellow_pink_jobs.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
 }
 
 // ── Keyboard nav ───────────────────────────────────────
