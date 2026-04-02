@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip list:*)",
+      "Bash(pip install:*)",
+      "Bash(curl -s http://localhost:8000/api/health)",
+      "Bash(python3:*)"
+    ]
+  }
+}
