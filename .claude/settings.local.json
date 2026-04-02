@@ -26,7 +26,8 @@
       "Bash(kill 10381)",
       "Bash(fuser -k 8000/tcp)",
       "Bash(ls /mnt/c/Users/abuba/OneDrive/Documents/GitHub/qpi-machine-scheduler-v2/requirements*.txt)",
-      "Bash(pip freeze:*)"
+      "Bash(pip freeze:*)",
+      "Bash(python:*)"
     ]
   }
 }

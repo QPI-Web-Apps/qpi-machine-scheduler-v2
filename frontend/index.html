@@ -20,6 +20,7 @@
       <input type="file" id="fileInput" accept=".xlsx,.xls">
       <span class="file-name" id="fileName"></span>
       <button class="run-btn" id="runBtn" disabled onclick="runSchedule()">Generate</button>
+      <button class="run-btn" id="exportBtn" style="display:none;" onclick="exportExcel()">Export Excel</button>
     </div>
   </div>
   <div class="header-controls">
@@ -338,6 +339,7 @@ async function runSchedule() {
   document.getElementById('loading').classList.add('show');
   document.getElementById('statsBar').style.display = 'none';
   document.getElementById('tabsBar').style.display = 'none';
+  document.getElementById('exportBtn').style.display = 'none';
   document.querySelectorAll('.tab-panel').forEach(p => p.style.display = 'none');
 
   const formData = new FormData();
@@ -364,12 +366,18 @@ async function runSchedule() {
   }
 }
 
+function exportExcel() {
+  if (!scheduleData || !scheduleData.schedule_id) return;
+  window.location.href = '/api/schedule/' + scheduleData.schedule_id + '/export';
+}
+
 // ── On schedule loaded ─────────────────────────────────
 function onScheduleLoaded() {
   if (!scheduleData) return;
 
   document.getElementById('statsBar').style.display = 'flex';
   document.getElementById('tabsBar').style.display = 'flex';
+  document.getElementById('exportBtn').style.display = 'inline-block';
   document.getElementById('panel-gantt').style.display = 'block';
 
   document.getElementById('statStatus').textContent = scheduleData.solver_status;

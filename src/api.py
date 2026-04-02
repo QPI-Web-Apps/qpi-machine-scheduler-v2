@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import uuid
 from datetime import datetime
@@ -12,8 +13,10 @@ from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
 from .calendar_utils import staffed_hours_between
+from .export import generate_schedule_excel
 from .scheduler import ScheduleResult, generate_schedule
 from .scheduler_io import SchedulerConfig
 
@@ -233,6 +236,26 @@ def get_schedule(schedule_id: str):
     if not stored:
         return JSONResponse({"error": "Schedule not found"}, status_code=404)
     return JSONResponse(stored["data"])
+
+
+@app.get("/api/schedule/{schedule_id}/export")
+def export_schedule(schedule_id: str):
+    """Download schedule as an Excel workbook (one sheet per machine)."""
+    stored = _results.get(schedule_id)
+    if not stored:
+        return JSONResponse({"error": "Schedule not found"}, status_code=404)
+
+    wb = generate_schedule_excel(stored["result"], stored["cfg"])
+    tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
+    wb.save(tmp.name)
+    tmp.close()
+
+    return FileResponse(
+        tmp.name,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=f"schedule_{schedule_id}.xlsx",
+        background=BackgroundTask(os.unlink, tmp.name),
+    )
 
 
 # Serve frontend
