@@ -133,9 +133,8 @@ def _assemble_schedule(
             if prev_tool is not None and prev_tool != batch.tool_id and spec.has_changeovers:
                 co_start = prev_end if prev_end else batch_start_dt
                 co_hours = spec.changeover_hours
-                # Changeover is wall-clock time
-                co_end = co_start + timedelta(hours=co_hours)
-                # Align co_end to working time for the next job
+                # Changeover consumes staffed time (skips non-working periods)
+                co_end = add_staffed_hours(co_start, co_hours, spd)
                 co_end_aligned = align_to_working_time(co_end, spd)
 
                 entry_type = "TOOL_SWAP" if spec.self_service_changeover else "CHANGEOVER"
@@ -211,9 +210,29 @@ def _compute_crew_movements(
     """
     movements: list[CrewMovement] = []
 
-    # Collect job starts for quick lookup
+    # Collect job starts that actually need crew from another machine.
+    # A job preceded by another JOB on the same machine already has crew
+    # (crew carries over), so it should not be a candidate for crew jumps.
+    by_machine: dict[str, list[ScheduleEntry]] = {}
+    for e in entries:
+        by_machine.setdefault(e.machine_id, []).append(e)
+    for mid in by_machine:
+        by_machine[mid].sort(key=lambda e: e.start)
+
+    needs_crew: set[tuple[str, datetime]] = set()
+    for mid, m_entries in by_machine.items():
+        for i, e in enumerate(m_entries):
+            if e.entry_type != "JOB":
+                continue
+            prev = m_entries[i - 1] if i > 0 else None
+            # Job needs external crew if it's the first entry, or preceded by
+            # a CHANGEOVER, NOT_RUNNING, or TOOL_SWAP (i.e. no carry-over crew)
+            if prev is None or prev.entry_type != "JOB":
+                needs_crew.add((e.machine_id, e.start))
+
     job_starts = [
-        e for e in entries if e.entry_type == "JOB"
+        e for e in entries
+        if e.entry_type == "JOB" and (e.machine_id, e.start) in needs_crew
     ]
 
     # ── Collect all "crew freed" events ──────────────────────────────
@@ -235,12 +254,7 @@ def _compute_crew_movements(
             freed_events.append((co.start, co.machine_id, hc, "changeover", co))
 
     # From end-of-work (job followed by nothing, NOT_RUNNING, or TOOL_SWAP)
-    by_machine: dict[str, list[ScheduleEntry]] = {}
-    for e in entries:
-        by_machine.setdefault(e.machine_id, []).append(e)
-
     for machine_id, m_entries in by_machine.items():
-        m_entries.sort(key=lambda e: e.start)
         for i, e in enumerate(m_entries):
             if e.entry_type != "JOB":
                 continue

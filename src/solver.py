@@ -277,18 +277,21 @@ def solve_schedule(
                 )
 
                 # Gap between consecutive batches with different tools
-                gap = 0
                 if bi.tool_id != bj.tool_id:
-                    gap = bi.changeover_minutes  # changeover duration for this machine
+                    gap_ij = bi.changeover_minutes   # bi finishes → changeover → bj starts
+                    gap_ji = bj.changeover_minutes   # bj finishes → changeover → bi starts
+                else:
+                    gap_ij = 0
+                    gap_ji = 0
 
-                # If bi before bj: end[bi] + gap <= start[bj]
+                # If bi before bj: end[bi] + gap_ij <= start[bj]
                 model.add(
-                    ends[bi.batch_id] + gap <= starts[bj.batch_id]
+                    ends[bi.batch_id] + gap_ij <= starts[bj.batch_id]
                 ).only_enforce_if(bi_before_bj)
 
-                # If bj before bi: end[bj] + gap <= start[bi]
+                # If bj before bi: end[bj] + gap_ji <= start[bi]
                 model.add(
-                    ends[bj.batch_id] + gap <= starts[bi.batch_id]
+                    ends[bj.batch_id] + gap_ji <= starts[bi.batch_id]
                 ).only_enforce_if(~bi_before_bj)
 
     # ── Max concurrent machines (cumulative) ────────────────────
