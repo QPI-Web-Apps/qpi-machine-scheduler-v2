@@ -304,16 +304,27 @@ def solve_schedule(
     all_demands = [1] * len(batches)
     model.add_cumulative(all_intervals, all_demands, max_concurrent)
 
-    # ── Objective: minimize makespan + priority boost ────────────
+    # ── Objective ────────────────────────────────────────────────
+    #
+    # All terms are composable and scaled relative to the horizon so
+    # that priorities, tardiness, and makespan interact predictably.
+    #
+    # Layer 1 (highest): late job count        (minimize_late only)
+    # Layer 2:           total tardiness        (minimize_late only)
+    # Layer 3:           priority start penalty (priority_boost / picked)
+    # Layer 4 (lowest):  makespan
 
     makespan = model.new_int_var(0, horizon, "makespan")
     for b in batches:
         model.add(makespan >= ends[b.batch_id])
 
-    objective = makespan
+    # Scale factor: normalizes start-based penalties so a batch at the
+    # end of the horizon contributes ~1× horizon, not an arbitrary multiple.
+    # This keeps priority terms meaningful without drowning out makespan.
+    n_batches = max(len(batches), 1)
 
-    # Minimize late jobs: count jobs finishing after their due date,
-    # with weighted tardiness to prefer less-late solutions at same count.
+    # ── Layer 1–2: minimize late (optional) ────────────────────
+    late_term = 0
     if cfg.minimize_late:
         late_vars = []
         tardiness_vars = []
@@ -326,61 +337,74 @@ def solve_schedule(
                 cumulative_min += job_run_min
 
                 due = job.get("due_date")
-                if not due or job.get("priority_class", 3) == 2:
-                    continue  # no due date or already past due
-
+                if not due:
+                    continue
+                # Include past-due jobs — push them early too
                 due_min = datetime_to_staffed_minute(due, cfg.schedule_start, spd)
-                if due_min <= 0:
-                    continue  # due before schedule start
 
                 # job end = batch start + cumulative run minutes
                 job_end = starts[b.batch_id] + cumulative_min
 
-                # Boolean: is this job late?
-                late_var = model.new_bool_var(f"late_{b.batch_id}_{j_idx}")
-                model.add(job_end > due_min).only_enforce_if(late_var)
-                model.add(job_end <= due_min).only_enforce_if(~late_var)
-                late_vars.append(late_var)
+                if due_min > 0:
+                    # Boolean: is this job late?
+                    late_var = model.new_bool_var(f"late_{b.batch_id}_{j_idx}")
+                    model.add(job_end > due_min).only_enforce_if(late_var)
+                    model.add(job_end <= due_min).only_enforce_if(~late_var)
+                    late_vars.append(late_var)
 
                 # Tardiness: how many minutes late (clamped to 0)
+                # For past-due (due_min <= 0), this still pushes them earlier
                 tardiness = model.new_int_var(0, horizon, f"tard_{b.batch_id}_{j_idx}")
-                model.add(tardiness >= job_end - due_min)
+                model.add(tardiness >= job_end - max(due_min, 0))
                 tardiness_vars.append(tardiness)
 
-        if late_vars:
-            late_count = sum(late_vars)
-            total_tardiness = sum(tardiness_vars)
-            # Hierarchy: fewer late >> less total tardiness >> shorter makespan
-            objective = (late_count * 10_000_000
-                         + total_tardiness * 100
-                         + makespan)
+        if late_vars or tardiness_vars:
+            late_count = sum(late_vars) if late_vars else 0
+            total_tardiness = sum(tardiness_vars) if tardiness_vars else 0
+            # Layer 1: each late job costs more than the worst possible
+            # tardiness, so the solver always prefers fewer late jobs.
+            # Layer 2: within the same late count, minimize total tardiness.
+            late_term = (late_count * horizon * n_batches
+                         + total_tardiness)
 
-    # Priority boost: penalize late starts of priority batches
-    elif cfg.priority_boost:
-        boost_terms = []
+    # ── Layer 3: priority / picked start penalties ─────────────
+    prio_term = 0
+
+    if cfg.priority_boost:
         for b in batches:
             min_prio = min((j.get("priority_class", 3) for j in b.jobs), default=3)
             if min_prio <= 0:       # P+ / picked / in-progress
-                boost_terms.append(10 * starts[b.batch_id])
+                prio_term += 3 * starts[b.batch_id]
             elif min_prio <= 2:     # Priority or Past Due
-                boost_terms.append(5 * starts[b.batch_id])
-        if boost_terms:
-            objective = makespan + sum(boost_terms)
+                prio_term += 1 * starts[b.batch_id]
 
-    # Always push picked batches early, regardless of mode
-    picked_terms = []
+    # Picked batches always get a push-early term (even without priority_boost)
     for b in batches:
         if any(j.get("is_picked") for j in b.jobs) and not b.has_in_progress:
-            picked_terms.append(10 * starts[b.batch_id])
-    if picked_terms:
-        objective = objective + sum(picked_terms)
+            prio_term += 3 * starts[b.batch_id]
+
+    # ── Combine layers ─────────────────────────────────────────
+    # late_term >> prio_term >> makespan
+    # Scale prio_term above makespan but below late_term
+    has_prio = cfg.priority_boost or any(
+        any(j.get("is_picked") for j in b.jobs) for b in batches
+    )
+    has_late = cfg.minimize_late and (late_vars or tardiness_vars)
+
+    objective = makespan
+    if has_prio:
+        objective += prio_term * n_batches
+    if has_late:
+        objective += late_term * n_batches * horizon
 
     model.minimize(objective)
 
     # ── Solve ───────────────────────────────────────────────────
 
     solver = cp_model.CpSolver()
-    effective_limit = time_limit_seconds * 2 if cfg.minimize_late else time_limit_seconds
+    # More objective terms → harder problem → more time
+    complexity = 1 + (1 if cfg.minimize_late else 0) + (1 if cfg.priority_boost else 0)
+    effective_limit = time_limit_seconds * complexity
     solver.parameters.max_time_in_seconds = effective_limit
     solver.parameters.num_workers = 8
 
