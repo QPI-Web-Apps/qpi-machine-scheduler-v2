@@ -89,6 +89,10 @@ def generate_schedule(
     # Assemble: solver output → real schedule entries
     entries = _assemble_schedule(result, cfg)
 
+    # Stagger changeovers so no two maintenance COs overlap
+    if cfg.h3_enabled:
+        _stagger_changeovers(entries, cfg)
+
     # Annotate crew movements
     crew_movements = _compute_crew_movements(entries, cfg)
 
@@ -217,6 +221,150 @@ def _staffed_minute_to_datetime(
 ) -> datetime:
     """Convert a staffed-minutes offset to a real datetime."""
     return add_staffed_hours(schedule_start, minute / 60.0, shifts_per_day)
+
+
+# ── Changeover staggering (H3) ───────────────────────────────────
+
+def _stagger_changeovers(
+    entries: list[ScheduleEntry], cfg: SchedulerConfig
+) -> None:
+    """Slide maintenance changeovers within their windows to avoid simultaneous overlaps.
+
+    Each changeover has a window: [prev_job_end, next_job_start].  The changeover
+    must fit inside that window.  We greedily place each changeover at the earliest
+    time that doesn't conflict with already-placed changeovers on other machines.
+
+    Only affects CHANGEOVER entries (maintenance crew needed).  TOOL_SWAP entries
+    (self-service on LMB/SMB) are exempt — they don't use the maintenance crew.
+    """
+    # Build per-machine sorted entries
+    by_machine: dict[str, list[ScheduleEntry]] = {}
+    for e in entries:
+        by_machine.setdefault(e.machine_id, []).append(e)
+    for mid in by_machine:
+        by_machine[mid].sort(key=lambda e: e.start)
+
+    # Collect changeover entries with their slidable windows
+    cos: list[tuple[ScheduleEntry, datetime, datetime, timedelta]] = []
+    for e in entries:
+        if e.entry_type != "CHANGEOVER":
+            continue
+        m_ents = by_machine[e.machine_id]
+        idx = m_ents.index(e)
+
+        window_start = e.start  # = prev entry end (earliest possible)
+
+        # Window end = next JOB start on this machine
+        window_end = e.end
+        for nxt in m_ents[idx + 1:]:
+            if nxt.entry_type == "JOB":
+                window_end = nxt.start
+                break
+
+        duration = e.end - e.start
+        cos.append((e, window_start, window_end, duration))
+
+    # Sort by slack (tightest window first) so inflexible changeovers get
+    # placed first and flexible ones can slide around them.
+    cos.sort(key=lambda x: (x[2] - x[1]) - x[3])
+
+    # Greedily place each changeover at the earliest non-conflicting time
+    placed: list[tuple[datetime, datetime]] = []
+
+    for co_entry, window_start, window_end, duration in cos:
+        candidate = window_start
+
+        # Slide past any conflicting already-placed changeover
+        changed = True
+        while changed:
+            changed = False
+            for p_start, p_end in placed:
+                if candidate < p_end and (candidate + duration) > p_start:
+                    candidate = p_end
+                    changed = True
+
+        # Check if it still fits in the window
+        if candidate + duration > window_end + timedelta(minutes=2):
+            candidate = co_entry.start  # can't fit, keep original
+
+        co_entry.start = candidate
+        co_entry.end = candidate + duration
+        co_entry.shift = which_shift(
+            candidate, cfg.get_day_shift_map(co_entry.machine_id)
+        )
+
+        placed.append((co_entry.start, co_entry.end))
+
+    # Rebuild NOT_RUNNING gaps on machines that have changeovers
+    affected = set(co[0].machine_id for co in cos)
+    _rebuild_idle_gaps(entries, affected, cfg)
+
+    entries.sort(key=lambda e: (e.start, e.machine_id))
+
+
+def _rebuild_idle_gaps(
+    entries: list[ScheduleEntry],
+    machines: set[str],
+    cfg: SchedulerConfig,
+) -> None:
+    """Remove and recreate NOT_RUNNING entries for the specified machines.
+
+    Scans consecutive entries on each machine and fills gaps with NOT_RUNNING.
+    Also recreates the initial gap (schedule_start → first entry) if needed.
+    """
+    # Remove existing NOT_RUNNING for affected machines
+    to_remove = [
+        e for e in entries
+        if e.machine_id in machines and e.entry_type == "NOT_RUNNING"
+    ]
+    for e in to_remove:
+        entries.remove(e)
+
+    # Collect remaining entries per machine
+    by_machine: dict[str, list[ScheduleEntry]] = {}
+    for e in entries:
+        if e.machine_id in machines:
+            by_machine.setdefault(e.machine_id, []).append(e)
+
+    new_gaps: list[ScheduleEntry] = []
+
+    for mid in machines:
+        m_ents = sorted(by_machine.get(mid, []), key=lambda e: e.start)
+        if not m_ents:
+            continue
+        spd = cfg.get_day_shift_map(mid)
+
+        # Initial gap: schedule_start → first entry
+        aligned_start = align_to_working_time(cfg.schedule_start, spd)
+        if aligned_start < m_ents[0].start:
+            gap_hrs = staffed_hours_between(aligned_start, m_ents[0].start, spd)
+            if gap_hrs > 0.08:
+                new_gaps.append(ScheduleEntry(
+                    machine_id=mid,
+                    entry_type="NOT_RUNNING",
+                    start=aligned_start,
+                    end=m_ents[0].start,
+                    idle_type="NO_CREW",
+                    shift=which_shift(aligned_start, spd),
+                ))
+
+        # Inter-entry gaps
+        for i in range(len(m_ents) - 1):
+            gap_start = m_ents[i].end
+            gap_end = m_ents[i + 1].start
+            if gap_start < gap_end:
+                gap_hrs = staffed_hours_between(gap_start, gap_end, spd)
+                if gap_hrs > 0.08:
+                    new_gaps.append(ScheduleEntry(
+                        machine_id=mid,
+                        entry_type="NOT_RUNNING",
+                        start=gap_start,
+                        end=gap_end,
+                        idle_type="NO_CREW",
+                        shift=which_shift(gap_start, spd),
+                    ))
+
+    entries.extend(new_gaps)
 
 
 # ── Crew movement annotation ───────────────────────────────────────
