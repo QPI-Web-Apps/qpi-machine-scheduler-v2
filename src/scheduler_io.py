@@ -40,11 +40,7 @@ class SchedulerConfig:
     include_white: bool = False
     disabled_stations: list[str] = field(default_factory=list)
     disabled_machines: list[str] = field(default_factory=list)
-    hc_flex: int = 2
-    crew_transition_flex: int = 1
     default_headcount: float = DEFAULT_HEADCOUNT
-    max_staffed_override: Optional[int] = None
-    min_remaining_shift_hours: float = 1.0
     h3_enabled: bool = True
     initial_tools: dict[str, str] = field(default_factory=dict)
     priority_boost: bool = False
@@ -237,7 +233,7 @@ def load_jobs_from_excel(path: str, cfg: SchedulerConfig) -> tuple[list[dict], l
 
         # Machine eligibility
         preferred_machine = infer_machine_from_eqp(eqp_code)
-        eligible = _build_eligibility(station_group, is_labeler, is_bagger, preferred_machine)
+        eligible = _build_eligibility(station_group, is_labeler, preferred_machine)
         if not eligible:
             skipped.append({"reason": "no eligible machines", "so_number": so_number})
             continue
@@ -289,7 +285,6 @@ def load_jobs_from_excel(path: str, cfg: SchedulerConfig) -> tuple[list[dict], l
 def _build_eligibility(
     station_group: str,
     is_labeler: bool,
-    is_bagger: bool,
     preferred_machine: Optional[str],
 ) -> list[str]:
     """Determine which machines can run this job."""
@@ -301,9 +296,4 @@ def _build_eligibility(
     if is_labeler and station_group == "16":
         return ["16C"]
 
-    eligible = [m.machine_id for m in group_machines]
-
-    # Bagger constraint only applies within 16-group (narrows to 16A/B/C).
-    # For non-16 groups, bagger flag is just metadata (e.g. STF-20S-L-BS).
-
-    return eligible
+    return [m.machine_id for m in group_machines]

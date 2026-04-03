@@ -62,6 +62,57 @@ class ScheduleResult:
     solver_status: str
 
 
+# Minimum gap (hours) to generate a NOT_RUNNING entry.  Gaps smaller
+# than this are rounding noise and not worth showing on the timeline.
+MIN_GAP_HOURS = 0.08  # ~5 minutes
+
+
+@dataclass
+class MachineSummary:
+    """Per-machine hour breakdown for API and export."""
+    jobs: int
+    changeovers: int
+    job_hours: float
+    changeover_hours: float
+    no_crew_hours: float
+    total_hours: float
+    utilization: float
+    start: Optional[datetime] = None
+    end: Optional[datetime] = None
+
+
+def compute_machine_summary(
+    entries: list[ScheduleEntry],
+    machine_id: str,
+    cfg: "SchedulerConfig",
+) -> MachineSummary:
+    """Compute hour breakdown for a single machine."""
+    spd = cfg.get_day_shift_map(machine_id)
+    m_entries = [e for e in entries if e.machine_id == machine_id]
+
+    jobs = [e for e in m_entries if e.entry_type == "JOB"]
+    cos = [e for e in m_entries if e.entry_type in ("CHANGEOVER", "TOOL_SWAP")]
+    no_crew = [e for e in m_entries if e.entry_type == "NOT_RUNNING"]
+
+    job_hrs = sum(staffed_hours_between(e.start, e.end, spd) for e in jobs)
+    co_hrs = sum(staffed_hours_between(e.start, e.end, spd) for e in cos)
+    no_crew_hrs = sum(staffed_hours_between(e.start, e.end, spd) for e in no_crew)
+    total = job_hrs + co_hrs
+
+    sorted_ents = sorted(m_entries, key=lambda e: e.start) if m_entries else []
+    return MachineSummary(
+        jobs=len(jobs),
+        changeovers=len(cos),
+        job_hours=round(job_hrs, 1),
+        changeover_hours=round(co_hrs, 1),
+        no_crew_hours=round(no_crew_hrs, 1),
+        total_hours=round(total, 1),
+        utilization=round(job_hrs / total * 100, 1) if total > 0 else 0,
+        start=sorted_ents[0].start if sorted_ents else None,
+        end=sorted_ents[-1].end if sorted_ents else None,
+    )
+
+
 # ── Main entry point ────────────────────────────────────────────────
 
 def generate_schedule(
@@ -134,7 +185,7 @@ def _assemble_schedule(
             )
             aligned_start = align_to_working_time(schedule_start, spd)
             gap_hours = staffed_hours_between(aligned_start, first_start, spd)
-            if gap_hours > 0.08:
+            if gap_hours > MIN_GAP_HOURS:
                 entries.append(ScheduleEntry(
                     machine_id=machine_id,
                     entry_type="NOT_RUNNING",
@@ -180,7 +231,7 @@ def _assemble_schedule(
                 # insert NOT_RUNNING
                 if co_end_aligned < batch_start_dt:
                     gap_hours = staffed_hours_between(co_end_aligned, batch_start_dt, spd)
-                    if gap_hours > 0.08:
+                    if gap_hours > MIN_GAP_HOURS:
                         entries.append(ScheduleEntry(
                             machine_id=machine_id,
                             entry_type="NOT_RUNNING",
@@ -338,7 +389,7 @@ def _rebuild_idle_gaps(
         aligned_start = align_to_working_time(cfg.schedule_start, spd)
         if aligned_start < m_ents[0].start:
             gap_hrs = staffed_hours_between(aligned_start, m_ents[0].start, spd)
-            if gap_hrs > 0.08:
+            if gap_hrs > MIN_GAP_HOURS:
                 new_gaps.append(ScheduleEntry(
                     machine_id=mid,
                     entry_type="NOT_RUNNING",
@@ -354,7 +405,7 @@ def _rebuild_idle_gaps(
             gap_end = m_ents[i + 1].start
             if gap_start < gap_end:
                 gap_hrs = staffed_hours_between(gap_start, gap_end, spd)
-                if gap_hrs > 0.08:
+                if gap_hrs > MIN_GAP_HOURS:
                     new_gaps.append(ScheduleEntry(
                         machine_id=mid,
                         entry_type="NOT_RUNNING",
@@ -472,8 +523,20 @@ def _compute_crew_movements(
         if not candidates:
             continue
 
-        # Prefer the closest job start after freed_time
-        target = min(candidates, key=lambda e: abs((e.start - freed_time).total_seconds()))
+        # Score candidates by time proximity AND headcount compatibility.
+        # Lower score = better match.
+        #   time_score:  seconds until target starts (0 = simultaneous)
+        #   hc_score:    headcount mismatch as fraction of freed crew
+        # Headcount match is weighted more: wasting 7 out of 11 people
+        # is worse than waiting 5 extra minutes.
+        max_window_sec = window.total_seconds()
+        def _crew_score(e):
+            time_score = abs((e.start - freed_time).total_seconds()) / max_window_sec
+            target_hc = e.headcount or hc
+            hc_gap = abs(hc - target_hc) / max(hc, 1)
+            return hc_gap * 2.0 + time_score
+
+        target = min(candidates, key=_crew_score)
 
         # Anchor the arrow to the target job's start so the visual
         # indicator aligns with the bar on the Gantt chart.

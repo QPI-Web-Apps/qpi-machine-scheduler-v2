@@ -15,9 +15,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
-from .calendar_utils import staffed_hours_between
 from .export import generate_schedule_excel
-from .scheduler import ScheduleResult, generate_schedule
+from .scheduler import ScheduleResult, compute_machine_summary, generate_schedule
 from .scheduler_io import SchedulerConfig
 
 app = FastAPI(title="QPI Machine Scheduler V2")
@@ -29,7 +28,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory store for schedule results (keyed by schedule_id)
+# In-memory store for schedule results (keyed by schedule_id).
+# Bounded to prevent memory growth on long-running deployments.
+_MAX_RESULTS = 20
 _results: dict[str, dict] = {}
 
 
@@ -72,53 +73,21 @@ def _result_to_json(result: ScheduleResult, cfg: SchedulerConfig) -> dict:
             entry["crew_to"] = e.crew_to
         entries_json.append(entry)
 
-    # Per-machine summary
-    from collections import defaultdict
+    # Per-machine summary (shared helper eliminates duplication with export.py)
+    machine_ids = sorted(set(e.machine_id for e in result.entries))
     machine_summary = {}
-    by_machine = defaultdict(list)
-    for e in result.entries:
-        by_machine[e.machine_id].append(e)
-
-    # Build a set of (machine, time) where crew is actually present.
-    # Crew is present when: running a JOB, or doing a TOOL_SWAP (self-service).
-    # Crew is NOT present during: CHANGEOVER (crew freed), NOT_RUNNING (no crew).
-    # Idle = crew present but no job. Currently only IDLE_CREW entries
-    # or gaps where crew_from is set would count.
-
-    for mid in sorted(by_machine):
-        entries = by_machine[mid]
-        spd = cfg.get_day_shift_map(mid)
-        jobs = [e for e in entries if e.entry_type == "JOB"]
-        cos = [e for e in entries if e.entry_type in ("CHANGEOVER", "TOOL_SWAP")]
-        # Only count idle when crew is present but has no work (IDLE_CREW type)
-        idle_crew = [
-            e for e in entries
-            if e.entry_type == "NOT_RUNNING" and e.idle_type == "CREW_WAITING"
-        ]
-        no_crew = [
-            e for e in entries
-            if e.entry_type == "NOT_RUNNING" and e.idle_type != "CREW_WAITING"
-        ]
-
-        job_hrs = sum(staffed_hours_between(e.start, e.end, spd) for e in jobs)
-        co_hrs = sum(staffed_hours_between(e.start, e.end, spd) for e in cos)
-        idle_hrs = sum(staffed_hours_between(e.start, e.end, spd) for e in idle_crew)
-        no_crew_hrs = sum(staffed_hours_between(e.start, e.end, spd) for e in no_crew)
-        total = job_hrs + co_hrs + idle_hrs
-
-        sorted_entries = sorted(entries, key=lambda e: e.start)
+    for mid in machine_ids:
+        s = compute_machine_summary(result.entries, mid, cfg)
         machine_summary[mid] = {
-            "jobs": len(jobs),
-            "changeovers": len(cos),
-            "idle_blocks": len(idle_crew),
-            "job_hours": round(job_hrs, 1),
-            "changeover_hours": round(co_hrs, 1),
-            "idle_hours": round(idle_hrs, 1),
-            "no_crew_hours": round(no_crew_hrs, 1),
-            "total_hours": round(total, 1),
-            "utilization": round(job_hrs / total * 100, 1) if total > 0 else 0,
-            "start": sorted_entries[0].start.isoformat() if sorted_entries else None,
-            "end": sorted_entries[-1].end.isoformat() if sorted_entries else None,
+            "jobs": s.jobs,
+            "changeovers": s.changeovers,
+            "job_hours": s.job_hours,
+            "changeover_hours": s.changeover_hours,
+            "no_crew_hours": s.no_crew_hours,
+            "total_hours": s.total_hours,
+            "utilization": s.utilization,
+            "start": s.start.isoformat() if s.start else None,
+            "end": s.end.isoformat() if s.end else None,
         }
 
     crew_json = [
@@ -238,7 +207,10 @@ async def create_schedule(
     response_data = _result_to_json(result, cfg)
     response_data["schedule_id"] = schedule_id
 
-    # Store for download
+    # Store for download (evict oldest if at capacity)
+    if len(_results) >= _MAX_RESULTS:
+        oldest = next(iter(_results))
+        del _results[oldest]
     _results[schedule_id] = {
         "result": result,
         "cfg": cfg,

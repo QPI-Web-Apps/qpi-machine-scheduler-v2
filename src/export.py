@@ -9,9 +9,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill, numbers
 from openpyxl.utils import get_column_letter
 
-from .calendar_utils import staffed_hours_between
 from .models import MACHINES, MACHINE_BY_ID
-from .scheduler import ScheduleResult
+from .scheduler import ScheduleResult, compute_machine_summary
 from .scheduler_io import SchedulerConfig
 
 # ── Column definitions ─────────────────────────────────────────────
@@ -119,47 +118,30 @@ def _write_summary_sheet(wb, result, cfg, by_machine):
         ws.column_dimensions[get_column_letter(col_idx)].width = width
     ws.freeze_panes = "A2"
 
-    totals = {"jobs": 0, "job_hrs": 0, "co_hrs": 0, "idle_hrs": 0,
-              "no_crew_hrs": 0, "total_hrs": 0}
+    totals = {"jobs": 0, "job_hrs": 0.0, "co_hrs": 0.0,
+              "no_crew_hrs": 0.0, "total_hrs": 0.0}
 
     row = 2
     for spec in MACHINES:
-        entries = by_machine.get(spec.machine_id, [])
-        spd = cfg.get_day_shift_map(spec.machine_id)
+        s = compute_machine_summary(result.entries, spec.machine_id, cfg)
 
-        jobs = [e for e in entries if e.entry_type == "JOB"]
-        cos = [e for e in entries if e.entry_type in ("CHANGEOVER", "TOOL_SWAP")]
-        idle_crew = [e for e in entries
-                     if e.entry_type == "NOT_RUNNING" and e.idle_type == "CREW_WAITING"]
-        no_crew = [e for e in entries
-                   if e.entry_type == "NOT_RUNNING" and e.idle_type != "CREW_WAITING"]
-
-        job_hrs = sum(staffed_hours_between(e.start, e.end, spd) for e in jobs)
-        co_hrs = sum(staffed_hours_between(e.start, e.end, spd) for e in cos)
-        idle_hrs = sum(staffed_hours_between(e.start, e.end, spd) for e in idle_crew)
-        no_crew_hrs = sum(staffed_hours_between(e.start, e.end, spd) for e in no_crew)
-        total = job_hrs + co_hrs + idle_hrs
-        util = round(job_hrs / total * 100, 1) if total > 0 else 0
-
-        sorted_entries = sorted(entries, key=lambda e: e.start) if entries else []
-        start_str = sorted_entries[0].start.strftime("%m/%d/%Y %H:%M") if sorted_entries else ""
-        end_str = sorted_entries[-1].end.strftime("%m/%d/%Y %H:%M") if sorted_entries else ""
+        start_str = s.start.strftime("%m/%d/%Y %H:%M") if s.start else ""
+        end_str = s.end.strftime("%m/%d/%Y %H:%M") if s.end else ""
 
         values = [
-            spec.display_name, len(jobs),
-            round(job_hrs, 1), round(co_hrs, 1), round(idle_hrs, 1),
-            round(no_crew_hrs, 1), round(total, 1), util,
+            spec.display_name, s.jobs,
+            s.job_hours, s.changeover_hours, 0,  # idle_hours placeholder
+            s.no_crew_hours, s.total_hours, s.utilization,
             start_str, end_str,
         ]
         for col_idx, val in enumerate(values, 1):
             ws.cell(row=row, column=col_idx, value=val)
 
-        totals["jobs"] += len(jobs)
-        totals["job_hrs"] += job_hrs
-        totals["co_hrs"] += co_hrs
-        totals["idle_hrs"] += idle_hrs
-        totals["no_crew_hrs"] += no_crew_hrs
-        totals["total_hrs"] += total
+        totals["jobs"] += s.jobs
+        totals["job_hrs"] += s.job_hours
+        totals["co_hrs"] += s.changeover_hours
+        totals["no_crew_hrs"] += s.no_crew_hours
+        totals["total_hrs"] += s.total_hours
         row += 1
 
     # Total row
@@ -167,7 +149,7 @@ def _write_summary_sheet(wb, result, cfg, by_machine):
     total_values = [
         "TOTAL", totals["jobs"],
         round(totals["job_hrs"], 1), round(totals["co_hrs"], 1),
-        round(totals["idle_hrs"], 1), round(totals["no_crew_hrs"], 1),
+        0, round(totals["no_crew_hrs"], 1),
         round(totals["total_hrs"], 1), total_util, "", "",
     ]
     for col_idx, val in enumerate(total_values, 1):
