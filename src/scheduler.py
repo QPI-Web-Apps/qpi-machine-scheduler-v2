@@ -498,53 +498,53 @@ def _compute_crew_movements(
                     if hc:
                         freed_events.append((next_entry.end, machine_id, hc, "end_of_work", next_entry))
 
-    # ── Sort chronologically, then assign to nearest unclaimed target ─
-    freed_events.sort(key=lambda ev: ev[0])
+    # ── Match freed crew to targets by best score, not chronologically ─
+    # Pre-compute the best candidate for each freed event, then process
+    # in score order so the tightest matches are assigned first.  This
+    # prevents an early-freed crew (e.g. SMB at 18:14) from claiming a
+    # target that a later-freed crew (e.g. 8 at 20:03) is a near-perfect
+    # match for.
+    tolerance = timedelta(minutes=30)
+    window = timedelta(hours=3)
+    max_window_sec = window.total_seconds()
 
-    used_sources: set[tuple[str, datetime]] = set()
+    def _score(freed_time, hc, target):
+        time_score = abs((target.start - freed_time).total_seconds()) / max_window_sec
+        target_hc = target.headcount or hc
+        hc_gap = abs(hc - target_hc) / max(hc, 1)
+        return time_score + hc_gap * 0.1
+
+    # Build (score, freed_event_index, target) for every possible pairing
+    pairings: list[tuple[float, int, ScheduleEntry]] = []
+    for idx, (freed_time, freed_machine, hc, reason, source_entry) in enumerate(freed_events):
+        for e in job_starts:
+            if (e.machine_id != freed_machine
+                    and e.start >= freed_time - tolerance
+                    and e.start <= freed_time + window):
+                pairings.append((_score(freed_time, hc, e), idx, e))
+
+    # Sort by score (best matches first) and greedily assign
+    pairings.sort(key=lambda p: p[0])
+
+    used_sources: set[int] = set()              # freed event indices
     claimed_targets: set[tuple[str, datetime]] = set()
 
-    for freed_time, freed_machine, hc, reason, source_entry in freed_events:
-        if (freed_machine, freed_time) in used_sources:
+    for _score_val, idx, target in pairings:
+        if idx in used_sources:
+            continue
+        if (target.machine_id, target.start) in claimed_targets:
             continue
 
-        # Only match jobs the crew can reach on time — never mutate the
-        # solver's schedule.  A small tolerance (5 min) covers rounding
-        # between staffed-minute conversion and datetime arithmetic.
-        tolerance = timedelta(minutes=5)
-        window = timedelta(hours=3)
-        candidates = [
-            e for e in job_starts
-            if e.machine_id != freed_machine
-            and e.start >= freed_time - tolerance
-            and e.start <= freed_time + window
-            and (e.machine_id, e.start) not in claimed_targets
-        ]
-        if not candidates:
-            continue
+        freed_time, freed_machine, hc, reason, source_entry = freed_events[idx]
 
-        # Score candidates by time proximity, with headcount as tiebreaker.
-        # Lower score = better match.  Time dominates: send crew to
-        # whatever is starting NOW, only use headcount fit to choose
-        # between jobs starting at roughly the same time.
-        max_window_sec = window.total_seconds()
-        def _crew_score(e):
-            time_score = abs((e.start - freed_time).total_seconds()) / max_window_sec
-            target_hc = e.headcount or hc
-            hc_gap = abs(hc - target_hc) / max(hc, 1)
-            return time_score + hc_gap * 0.1
-
-        target = min(candidates, key=_crew_score)
-
-        # Anchor the arrow to the target job's start so the visual
-        # indicator aligns with the bar on the Gantt chart.
+        # Anchor the arrow to the target job's start
         move_time = target.start
 
         if source_entry:
             source_entry.crew_to = target.machine_id
         target.crew_from = freed_machine
 
-        used_sources.add((freed_machine, freed_time))
+        used_sources.add(idx)
         claimed_targets.add((target.machine_id, target.start))
 
         movements.append(CrewMovement(
