@@ -523,18 +523,16 @@ def _compute_crew_movements(
         if not candidates:
             continue
 
-        # Score candidates by time proximity AND headcount compatibility.
-        # Lower score = better match.
-        #   time_score:  seconds until target starts (0 = simultaneous)
-        #   hc_score:    headcount mismatch as fraction of freed crew
-        # Headcount match is weighted more: wasting 7 out of 11 people
-        # is worse than waiting 5 extra minutes.
+        # Score candidates by time proximity, with headcount as tiebreaker.
+        # Lower score = better match.  Time dominates: send crew to
+        # whatever is starting NOW, only use headcount fit to choose
+        # between jobs starting at roughly the same time.
         max_window_sec = window.total_seconds()
         def _crew_score(e):
             time_score = abs((e.start - freed_time).total_seconds()) / max_window_sec
             target_hc = e.headcount or hc
             hc_gap = abs(hc - target_hc) / max(hc, 1)
-            return hc_gap * 2.0 + time_score
+            return time_score + hc_gap * 0.1
 
         target = min(candidates, key=_crew_score)
 
