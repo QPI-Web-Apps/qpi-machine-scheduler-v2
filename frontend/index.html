@@ -21,6 +21,9 @@
       <span class="file-name" id="fileName"></span>
       <button class="run-btn" id="runBtn" disabled onclick="runSchedule()">Generate</button>
       <button class="run-btn" id="exportBtn" style="display:none;" onclick="exportExcel()">Export Excel</button>
+      <button class="run-btn" id="saveJsonBtn" style="display:none;" onclick="saveScheduleJson()">Save JSON</button>
+      <button class="upload-btn" onclick="document.getElementById('jsonFileInput').click()">Load JSON</button>
+      <input type="file" id="jsonFileInput" accept=".json" style="display:none;">
     </div>
   </div>
   <div class="header-controls">
@@ -389,6 +392,7 @@ async function runSchedule() {
   document.getElementById('statsBar').style.display = 'none';
   document.getElementById('tabsBar').style.display = 'none';
   document.getElementById('exportBtn').style.display = 'none';
+  document.getElementById('saveJsonBtn').style.display = 'none';
   document.querySelectorAll('.tab-panel').forEach(p => p.style.display = 'none');
 
   const formData = new FormData();
@@ -421,13 +425,100 @@ function exportExcel() {
   window.location.href = '/api/schedule/' + scheduleData.schedule_id + '/export';
 }
 
+// ── Save / Load JSON ──────────────────────────────────
+function saveScheduleJson() {
+  if (!scheduleData) return;
+  const payload = {
+    _meta: { saved_at: new Date().toISOString(), version: 1, source: 'QPI Machine Scheduler' },
+    config: {
+      reference_date: document.getElementById('refDate').value,
+      reference_time: document.getElementById('refTime').value,
+      max_concurrent: document.getElementById('maxConcurrent').value,
+      include_yellow: document.getElementById('inclYellow').checked,
+      include_pink: document.getElementById('inclPink').checked,
+      include_white: document.getElementById('inclWhite').checked,
+      priority_boost: document.getElementById('prioBoost').checked,
+      minimize_late: document.getElementById('minimizeLate').checked,
+      shift_config: shiftConfig,
+      disabled_machines: getDisabledMachines(),
+      initial_tools: getInitialTools()
+    },
+    scheduleData: scheduleData
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  const dateStr = document.getElementById('refDate').value || 'unknown';
+  const id = scheduleData.schedule_id || 'draft';
+  a.download = `schedule_${dateStr}_${id}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+document.getElementById('jsonFileInput').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (event) => {
+    try {
+      const parsed = JSON.parse(event.target.result);
+      if (parsed.scheduleData && parsed.scheduleData.schedule) {
+        scheduleData = parsed.scheduleData;
+        if (parsed.config) restoreConfig(parsed.config);
+      } else if (parsed.schedule && parsed.machines) {
+        scheduleData = parsed;
+      } else {
+        alert('Invalid schedule JSON file.');
+        return;
+      }
+      document.getElementById('emptyState').style.display = 'none';
+      document.getElementById('loading').classList.remove('show');
+      onScheduleLoaded();
+    } catch (err) {
+      alert('Failed to parse JSON: ' + err.message);
+    }
+  };
+  reader.readAsText(file);
+  e.target.value = '';
+});
+
+function restoreConfig(config) {
+  if (config.reference_date) document.getElementById('refDate').value = config.reference_date;
+  if (config.reference_time) document.getElementById('refTime').value = config.reference_time;
+  if (config.max_concurrent) document.getElementById('maxConcurrent').value = config.max_concurrent;
+  if (config.include_yellow !== undefined) document.getElementById('inclYellow').checked = config.include_yellow;
+  if (config.include_pink !== undefined) document.getElementById('inclPink').checked = config.include_pink;
+  if (config.include_white !== undefined) document.getElementById('inclWhite').checked = config.include_white;
+  if (config.priority_boost !== undefined) document.getElementById('prioBoost').checked = config.priority_boost;
+  if (config.minimize_late !== undefined) document.getElementById('minimizeLate').checked = config.minimize_late;
+  if (config.shift_config && typeof config.shift_config === 'object') {
+    shiftConfig = config.shift_config;
+    initShiftGrid();
+    shiftConfig = config.shift_config;
+    renderShiftGrid();
+  }
+  if (config.initial_tools) {
+    Object.entries(config.initial_tools).forEach(([mid, val]) => {
+      const el = document.getElementById('it_' + mid);
+      if (el) el.value = val;
+    });
+  }
+  if (config.disabled_machines && Array.isArray(config.disabled_machines)) {
+    MACHINE_ORDER.forEach(mid => {
+      enabledMachines[mid] = !config.disabled_machines.includes(mid);
+    });
+    renderMachineToggles();
+  }
+}
+
 // ── On schedule loaded ─────────────────────────────────
 function onScheduleLoaded() {
   if (!scheduleData) return;
 
   document.getElementById('statsBar').style.display = 'flex';
   document.getElementById('tabsBar').style.display = 'flex';
-  document.getElementById('exportBtn').style.display = 'inline-block';
+  document.getElementById('exportBtn').style.display = scheduleData.schedule_id ? 'inline-block' : 'none';
+  document.getElementById('saveJsonBtn').style.display = 'inline-block';
   document.getElementById('panel-gantt').style.display = 'block';
 
   document.getElementById('statStatus').textContent = scheduleData.solver_status;
