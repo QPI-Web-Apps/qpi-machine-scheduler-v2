@@ -152,6 +152,14 @@ def _assemble_schedule(
                 co_hours = spec.changeover_hours
                 # Changeover consumes staffed time (skips non-working periods)
                 co_end = add_staffed_hours(co_start, co_hours, spd)
+
+                # Snap changeover end to batch start when the difference is
+                # just rounding noise (solver uses integer minutes, assembly
+                # uses fractional hours).  Eliminates tiny visual gaps/overlaps.
+                rounding_gap = abs((co_end - batch_start_dt).total_seconds())
+                if rounding_gap < 120:  # < 2 min = rounding noise
+                    co_end = batch_start_dt
+
                 co_end_aligned = align_to_working_time(co_end, spd)
 
                 entry_type = "TOOL_SWAP" if spec.self_service_changeover else "CHANGEOVER"
