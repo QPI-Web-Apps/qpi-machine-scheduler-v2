@@ -16,7 +16,7 @@ from typing import Optional
 from ortools.sat.python import cp_model
 
 from .calendar_utils import add_staffed_hours, datetime_to_staffed_minute
-from .models import MACHINE_BY_ID, machines_in_group
+from .models import MACHINE_BY_ID
 from .scheduler_io import SchedulerConfig
 
 
@@ -29,12 +29,7 @@ class ToolBatch:
     tool_id: str
     jobs: list[dict]
     total_minutes: int  # staffed minutes
-    changeover_minutes: int  # cost to switch TO this batch's tool (0 if first or same tool)
     has_in_progress: bool = False  # True if any job is currently running
-
-    @property
-    def total_hours(self) -> float:
-        return self.total_minutes / 60.0
 
 
 @dataclass
@@ -175,8 +170,6 @@ def build_tool_batches(
             total_min = max(1, round(total_hrs * 60))
 
             has_ip = any(j.get("is_in_progress") for j in tool_jobs)
-            # In-progress batches: no changeover (already running)
-            co_min = 0 if has_ip else (round(spec.changeover_hours * 60) if spec.has_changeovers else 0)
 
             batches.append(ToolBatch(
                 batch_id=batch_id,
@@ -184,7 +177,6 @@ def build_tool_batches(
                 tool_id=tool_id,
                 jobs=tool_jobs,
                 total_minutes=total_min,
-                changeover_minutes=co_min,
                 has_in_progress=has_ip,
             ))
             batch_id += 1
@@ -213,9 +205,17 @@ def solve_schedule(
 
     model = cp_model.CpModel()
 
-    # Horizon: sum of all work + all possible changeovers (generous upper bound)
+    # Horizon: sum of all work + worst-case changeovers (generous upper bound)
     total_work = sum(b.total_minutes for b in batches)
-    total_co = sum(b.changeover_minutes for b in batches)
+    # Each machine can have at most (num_batches - 1) changeovers
+    machine_batch_counts: dict[str, int] = {}
+    for b in batches:
+        machine_batch_counts[b.machine_id] = machine_batch_counts.get(b.machine_id, 0) + 1
+    total_co = sum(
+        max(0, count - 1) * round(MACHINE_BY_ID[mid].changeover_hours * 60)
+        for mid, count in machine_batch_counts.items()
+        if MACHINE_BY_ID[mid].has_changeovers
+    )
     horizon = total_work + total_co + 480  # extra shift buffer
 
     # ── Variables ────────────────────────────────────────────────
@@ -268,6 +268,10 @@ def solve_schedule(
         if len(m_batches) <= 1:
             continue
 
+        # Machine-level changeover cost (same for all batch pairs on this machine)
+        spec = MACHINE_BY_ID[machine_id]
+        machine_co = round(spec.changeover_hours * 60) if spec.has_changeovers else 0
+
         # No-overlap: handled via pairwise ordering
         for i, bi in enumerate(m_batches):
             for bj in m_batches[i + 1:]:
@@ -276,12 +280,7 @@ def solve_schedule(
                     f"order_{bi.batch_id}_{bj.batch_id}"
                 )
 
-                # Gap between consecutive batches with different tools.
-                # Use the machine's changeover cost — not the batch's co_min,
-                # which is 0 for in-progress batches (they don't need a
-                # changeover to *start*, but switching *away* from them does).
-                spec = MACHINE_BY_ID[machine_id]
-                machine_co = round(spec.changeover_hours * 60) if spec.has_changeovers else 0
+                # Gap between consecutive batches with different tools
                 if bi.tool_id != bj.tool_id:
                     gap_ij = machine_co   # bi finishes → changeover → bj starts
                     gap_ji = machine_co   # bj finishes → changeover → bi starts
@@ -316,11 +315,11 @@ def solve_schedule(
     # Minimize late jobs: count jobs finishing after their due date,
     # with weighted tardiness to prefer less-late solutions at same count.
     if cfg.minimize_late:
-        spd = cfg.get_day_shift_map("16A")  # default shift map for date conversion
         late_vars = []
         tardiness_vars = []
 
         for b in batches:
+            spd = cfg.get_day_shift_map(b.machine_id)
             cumulative_min = 0
             for j_idx, job in enumerate(b.jobs):
                 job_run_min = max(1, round(job["run_hours"] * 60))

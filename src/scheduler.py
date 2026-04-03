@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
 
 from .calendar_utils import (
     add_staffed_hours,
     align_to_working_time,
-    shift_end_for_time,
     staffed_hours_between,
     which_shift,
 )
@@ -123,6 +122,24 @@ def _assemble_schedule(
         prev_tool: Optional[str] = cfg.initial_tools.get(machine_id)
         prev_end: Optional[datetime] = None
 
+        # If the first batch doesn't start at minute 0, emit a NOT_RUNNING
+        # gap so the frontend timeline shows why the machine was idle.
+        if m_batches and m_batches[0].start_minute > 0:
+            first_start = _staffed_minute_to_datetime(
+                m_batches[0].start_minute, schedule_start, spd
+            )
+            aligned_start = align_to_working_time(schedule_start, spd)
+            gap_hours = staffed_hours_between(aligned_start, first_start, spd)
+            if gap_hours > 0.08:
+                entries.append(ScheduleEntry(
+                    machine_id=machine_id,
+                    entry_type="NOT_RUNNING",
+                    start=aligned_start,
+                    end=first_start,
+                    idle_type="NO_CREW",
+                    shift=which_shift(aligned_start, spd),
+                ))
+
         for sb in m_batches:
             batch = sb.batch
             batch_start_dt = _staffed_minute_to_datetime(
@@ -226,8 +243,9 @@ def _compute_crew_movements(
                 continue
             prev = m_entries[i - 1] if i > 0 else None
             # Job needs external crew if it's the first entry, or preceded by
-            # a CHANGEOVER, NOT_RUNNING, or TOOL_SWAP (i.e. no carry-over crew)
-            if prev is None or prev.entry_type != "JOB":
+            # a CHANGEOVER or NOT_RUNNING.  TOOL_SWAP is self-service — crew
+            # stays on the machine and continues into the next job.
+            if prev is None or prev.entry_type not in ("JOB", "TOOL_SWAP"):
                 needs_crew.add((e.machine_id, e.start))
 
     job_starts = [
@@ -264,10 +282,14 @@ def _compute_crew_movements(
                 if hc:
                     freed_events.append((e.end, machine_id, hc, "end_of_work", e))
             elif next_entry.entry_type == "TOOL_SWAP":
-                # Self-service: crew does the swap themselves, freed after it completes
-                hc = e.headcount or 0
-                if hc:
-                    freed_events.append((next_entry.end, machine_id, hc, "end_of_work", next_entry))
+                # Self-service: crew does the swap themselves.
+                # Only free crew if there's no follow-on job after the swap
+                # (crew stays on the machine to run the next batch).
+                after_swap = m_entries[i + 2] if i + 2 < len(m_entries) else None
+                if after_swap is None or after_swap.entry_type != "JOB":
+                    hc = e.headcount or 0
+                    if hc:
+                        freed_events.append((next_entry.end, machine_id, hc, "end_of_work", next_entry))
 
     # ── Sort chronologically, then assign to nearest unclaimed target ─
     freed_events.sort(key=lambda ev: ev[0])
@@ -297,7 +319,9 @@ def _compute_crew_movements(
         # Prefer the closest job start after freed_time
         target = min(candidates, key=lambda e: abs((e.start - freed_time).total_seconds()))
 
-        move_time = max(freed_time, target.start)
+        # Anchor the arrow to the target job's start so the visual
+        # indicator aligns with the bar on the Gantt chart.
+        move_time = target.start
 
         if source_entry:
             source_entry.crew_to = target.machine_id

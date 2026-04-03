@@ -8,9 +8,6 @@ from datetime import datetime
 from typing import Optional
 
 
-TOOL_CHANGEOVER_HOURS = 2.0
-
-
 @dataclass
 class MachineSpec:
     machine_id: str
