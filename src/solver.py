@@ -276,10 +276,15 @@ def solve_schedule(
                     f"order_{bi.batch_id}_{bj.batch_id}"
                 )
 
-                # Gap between consecutive batches with different tools
+                # Gap between consecutive batches with different tools.
+                # Use the machine's changeover cost — not the batch's co_min,
+                # which is 0 for in-progress batches (they don't need a
+                # changeover to *start*, but switching *away* from them does).
+                spec = MACHINE_BY_ID[machine_id]
+                machine_co = round(spec.changeover_hours * 60) if spec.has_changeovers else 0
                 if bi.tool_id != bj.tool_id:
-                    gap_ij = bi.changeover_minutes   # bi finishes → changeover → bj starts
-                    gap_ji = bj.changeover_minutes   # bj finishes → changeover → bi starts
+                    gap_ij = machine_co   # bi finishes → changeover → bj starts
+                    gap_ji = machine_co   # bj finishes → changeover → bi starts
                 else:
                     gap_ij = 0
                     gap_ji = 0
