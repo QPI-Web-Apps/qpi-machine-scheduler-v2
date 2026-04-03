@@ -59,38 +59,43 @@ def assign_jobs_to_machines(
 ) -> dict[str, list[dict]]:
     """Route every job to a specific machine_id.
 
-    Single-machine groups are trivial.  For the 16-group, tools are
-    load-balanced across 16A/B/C (labeler tools forced to 16C).
-    All jobs sharing a tool go to the same machine.
+    Single-eligible jobs go directly.  Multi-eligible jobs are grouped
+    by their eligible set and load-balanced across those machines.
+    All jobs sharing a tool are assigned to the same machine.
     """
-    # Separate 16-group from others
-    group_16_jobs: list[dict] = []
     machine_jobs: dict[str, list[dict]] = {m: [] for m in MACHINE_BY_ID}
+    # Collect multi-eligible jobs keyed by their eligible set (as frozenset)
+    multi_eligible: dict[frozenset[str], list[dict]] = {}
 
     for job in jobs:
         eligible = job["eligible_machines"]
         if len(eligible) == 1:
             machine_jobs[eligible[0]].append(job)
         else:
-            # Multi-machine eligible → 16-group
-            group_16_jobs.append(job)
+            key = frozenset(eligible)
+            multi_eligible.setdefault(key, []).append(job)
 
-    # Assign 16-group tools to machines via greedy load-balance
-    if group_16_jobs:
-        _assign_16_group(group_16_jobs, machine_jobs,
-                         minimize_changeovers=cfg.priority_boost)
+    # Load-balance each multi-eligible group
+    for _eligible_set, group_jobs in multi_eligible.items():
+        _assign_multi_machine_group(
+            group_jobs, machine_jobs,
+            minimize_changeovers=cfg.priority_boost,
+        )
 
     return machine_jobs
 
 
-def _assign_16_group(
+def _assign_multi_machine_group(
     jobs: list[dict], machine_jobs: dict[str, list[dict]],
     minimize_changeovers: bool = False,
 ) -> None:
-    """Assign 16-group tools to 16A/B/C, balancing total hours.
+    """Assign jobs to machines within a multi-eligible group, balancing total hours.
+
+    Eligible machines and changeover costs are derived from each job's
+    eligible_machines list and the machine registry.
 
     When minimize_changeovers is True, adding a new tool to a machine incurs
-    a virtual 2-hour penalty (matching the changeover cost), encouraging
+    a virtual penalty equal to that machine's changeover cost, encouraging
     consolidation of tools on fewer machines.
     """
     # Group jobs by tool
@@ -102,26 +107,29 @@ def _assign_16_group(
     bundles: list[tuple[str, float, list[dict], list[str]]] = []
     for tool_id, tjobs in tool_jobs.items():
         total_hrs = sum(j["run_hours"] for j in tjobs)
-        # If any job in this tool is labeler-only (eligible = [16C]), force 16C
         eligible = tjobs[0]["eligible_machines"]
         bundles.append((tool_id, total_hrs, tjobs, eligible))
 
     # Sort largest first for better load balance
     bundles.sort(key=lambda b: -b[1])
 
+    # Derive the full set of machines this group can use
+    all_machines: set[str] = set()
+    for _, _, _, eligible in bundles:
+        all_machines.update(eligible)
+
     # Track load and tool count per machine
-    load = {"16A": 0.0, "16B": 0.0, "16C": 0.0}
-    tools_on: dict[str, int] = {"16A": 0, "16B": 0, "16C": 0}
-    # Add existing load from single-eligible jobs already assigned
-    for mid in load:
+    load: dict[str, float] = {}
+    tools_on: dict[str, int] = {}
+    for mid in all_machines:
         load[mid] = sum(j["run_hours"] for j in machine_jobs[mid])
         tools_on[mid] = len(set(j["tool_id"] for j in machine_jobs[mid]))
 
-    changeover_hrs = 2.0  # 16-group changeover cost
-
     for tool_id, total_hrs, tjobs, eligible in bundles:
         if minimize_changeovers:
-            best = min(eligible, key=lambda m: load[m] + changeover_hrs * tools_on[m])
+            best = min(eligible, key=lambda m: (
+                load[m] + MACHINE_BY_ID[m].changeover_hours * tools_on[m]
+            ))
         else:
             best = min(eligible, key=lambda m: load[m])
         for job in tjobs:
