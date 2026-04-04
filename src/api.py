@@ -15,9 +15,12 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
+import copy
+
 from .export import generate_schedule_excel
-from .scheduler import ScheduleResult, compute_machine_summary, generate_schedule
-from .scheduler_io import SchedulerConfig
+from .models import MACHINE_BY_ID
+from .scheduler import ScheduleResult, compute_machine_summary, generate_schedule, generate_schedule_from_jobs
+from .scheduler_io import SchedulerConfig, load_jobs_from_excel
 
 app = FastAPI(title="QPI Machine Scheduler V2")
 
@@ -47,6 +50,7 @@ def _result_to_json(result: ScheduleResult, cfg: SchedulerConfig) -> dict:
             "end": e.end.isoformat(),
             "tool_id": e.tool_id,
             "shift": e.shift,
+            "group": e.group,
         }
         if e.entry_type == "JOB" and e.job_data:
             entry.update({
@@ -114,6 +118,123 @@ def _result_to_json(result: ScheduleResult, cfg: SchedulerConfig) -> dict:
     }
 
 
+# ── Multi-group helpers ────────────────────────────────────────────
+
+def _assign_jobs_to_groups(
+    jobs: list[dict],
+    group_defs: dict[str, dict],
+) -> tuple[dict[str, list[dict]], list[dict]]:
+    """Partition jobs into machine groups by majority eligible machines.
+
+    Returns (group_jobs, extra_skipped).
+    """
+    # Build machine → group lookup
+    machine_to_group: dict[str, str] = {}
+    for gname, gdef in group_defs.items():
+        for mid in gdef.get("machines", []):
+            machine_to_group[mid] = gname
+
+    group_jobs: dict[str, list[dict]] = {g: [] for g in group_defs}
+    extra_skipped: list[dict] = []
+
+    for job in jobs:
+        eligible = job["eligible_machines"]
+        # Count eligible machines per group
+        counts: dict[str, int] = {}
+        for mid in eligible:
+            g = machine_to_group.get(mid)
+            if g:
+                counts[g] = counts.get(g, 0) + 1
+
+        if not counts:
+            extra_skipped.append({
+                "reason": "no eligible machines in any group",
+                "so_number": job.get("so_number"),
+            })
+            continue
+
+        # Assign to group with most eligible machines (alphabetical tiebreak)
+        best_group = max(counts, key=lambda g: (counts[g], g))
+        # Filter eligible_machines to only this group's machines
+        group_machines = set(group_defs[best_group].get("machines", []))
+        job["eligible_machines"] = [m for m in eligible if m in group_machines]
+
+        if not job["eligible_machines"]:
+            extra_skipped.append({
+                "reason": "no eligible machines after group filtering",
+                "so_number": job.get("so_number"),
+            })
+            continue
+
+        group_jobs[best_group].append(job)
+
+    return group_jobs, extra_skipped
+
+
+_STATUS_RANK = {"OPTIMAL": 0, "FEASIBLE": 1, "NO_JOBS": 2, "INFEASIBLE": 3, "UNKNOWN": 4}
+
+
+def _merge_results(
+    group_results: dict[str, ScheduleResult],
+    group_defs: dict[str, dict],
+) -> tuple[ScheduleResult, dict]:
+    """Merge per-group ScheduleResults into one combined result.
+
+    Returns (merged_result, groups_metadata).
+    """
+    all_entries = []
+    all_crew = []
+    all_skipped = []
+    max_makespan = 0.0
+    worst_status = "OPTIMAL"
+
+    groups_meta: dict[str, dict] = {}
+
+    for gname, result in group_results.items():
+        # Tag entries with group name for frontend
+        for e in result.entries:
+            e.group = gname  # type: ignore[attr-defined]
+        all_entries.extend(result.entries)
+        all_crew.extend(result.crew_movements)
+        all_skipped.extend(result.skipped_jobs)
+
+        if result.makespan_hours > max_makespan:
+            max_makespan = result.makespan_hours
+
+        if _STATUS_RANK.get(result.solver_status, 4) > _STATUS_RANK.get(worst_status, 0):
+            worst_status = result.solver_status
+
+        groups_meta[gname] = {
+            "machines": group_defs[gname].get("machines", []),
+            "max_concurrent": group_defs[gname].get("max_concurrent", 5),
+            "solver_status": result.solver_status,
+            "makespan_hours": round(result.makespan_hours, 1),
+            "total_jobs": len([e for e in result.entries if e.entry_type == "JOB"]),
+        }
+
+    all_entries.sort(key=lambda e: (e.start, e.machine_id))
+    all_crew.sort(key=lambda m: m.time)
+    # Deduplicate skipped (same job can appear in multiple groups' skipped lists)
+    seen_so = set()
+    deduped_skipped = []
+    for s in all_skipped:
+        key = s.get("so_number", "")
+        if key and key in seen_so:
+            continue
+        if key:
+            seen_so.add(key)
+        deduped_skipped.append(s)
+
+    merged = ScheduleResult(
+        entries=all_entries,
+        crew_movements=all_crew,
+        skipped_jobs=deduped_skipped,
+        makespan_hours=max_makespan,
+        solver_status=worst_status,
+    )
+    return merged, groups_meta
+
+
 # ── Endpoints ───────────────────────────────────────────────────────
 
 @app.get("/api/health")
@@ -135,6 +256,7 @@ async def create_schedule(
     priority_boost: bool = Form(default=False),
     minimize_late: bool = Form(default=False),
     disabled_machines: str = Form(default=""),
+    machine_groups: str = Form(default=""),
 ):
     """Upload Excel, generate schedule, return JSON."""
     # Parse reference date/time
@@ -192,6 +314,14 @@ async def create_schedule(
         except json.JSONDecodeError:
             pass
 
+    # Parse machine groups
+    parsed_groups: dict[str, dict] = {}
+    if machine_groups:
+        try:
+            parsed_groups = json.loads(machine_groups)
+        except json.JSONDecodeError:
+            pass
+
     # Save uploaded file temporarily
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
         content = await schedule_file.read()
@@ -199,13 +329,39 @@ async def create_schedule(
         tmp_path = tmp.name
 
     try:
-        result = generate_schedule(tmp_path, cfg, max_concurrent=max_concurrent)
+        if parsed_groups:
+            # Multi-group: load once, partition jobs, schedule each group
+            jobs, skipped = load_jobs_from_excel(tmp_path, cfg)
+            group_jobs, extra_skipped = _assign_jobs_to_groups(jobs, parsed_groups)
+            all_skipped = skipped + extra_skipped
+
+            group_results: dict[str, ScheduleResult] = {}
+            for gname, gdef in parsed_groups.items():
+                g_machines = gdef.get("machines", [])
+                g_max = gdef.get("max_concurrent", max_concurrent)
+                # Build per-group config: disable all machines NOT in this group
+                g_cfg = copy.deepcopy(cfg)
+                g_cfg.disabled_machines = [
+                    m for m in MACHINE_BY_ID if m not in g_machines
+                ]
+                g_jobs = group_jobs.get(gname, [])
+                group_results[gname] = generate_schedule_from_jobs(
+                    g_jobs, all_skipped, g_cfg, g_max
+                )
+
+            result, groups_meta = _merge_results(group_results, parsed_groups)
+        else:
+            # Single-group: existing path
+            result = generate_schedule(tmp_path, cfg, max_concurrent=max_concurrent)
+            groups_meta = None
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
     schedule_id = str(uuid.uuid4())[:8]
     response_data = _result_to_json(result, cfg)
     response_data["schedule_id"] = schedule_id
+    if groups_meta:
+        response_data["groups"] = groups_meta
 
     # Store for download (evict oldest if at capacity)
     if len(_results) >= _MAX_RESULTS:

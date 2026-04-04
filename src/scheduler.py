@@ -42,6 +42,7 @@ class ScheduleEntry:
     # Metadata
     shift: Optional[int] = None
     idle_type: Optional[str] = None  # NO_CREW for NOT_RUNNING
+    group: Optional[str] = None      # machine group name (multi-group mode)
 
 
 @dataclass
@@ -121,30 +122,29 @@ def generate_schedule(
     max_concurrent: int = 5,
 ) -> ScheduleResult:
     """Full pipeline: load Excel → optimize → assemble schedule."""
-    # Load
     jobs, skipped = load_jobs_from_excel(excel_path, cfg)
+    return generate_schedule_from_jobs(jobs, skipped, cfg, max_concurrent)
+
+
+def generate_schedule_from_jobs(
+    jobs: list[dict],
+    skipped: list[dict],
+    cfg: SchedulerConfig,
+    max_concurrent: int = 5,
+) -> ScheduleResult:
+    """Core pipeline: optimize → assemble → annotate crew. No Excel loading."""
     if not jobs:
         return ScheduleResult([], [], skipped, 0.0, "NO_JOBS")
 
-    # Assign jobs to machines
     machine_jobs = assign_jobs_to_machines(jobs, cfg)
-
-    # Build tool batches
     batches = build_tool_batches(machine_jobs)
-
-    # Solve
     result = solve_schedule(batches, cfg, max_concurrent=max_concurrent)
     if result.status not in ("OPTIMAL", "FEASIBLE"):
         return ScheduleResult([], [], skipped, 0.0, result.status)
 
-    # Assemble: solver output → real schedule entries
     entries = _assemble_schedule(result, cfg)
-
-    # Stagger changeovers so no two maintenance COs overlap
     if cfg.h3_enabled:
         _stagger_changeovers(entries, cfg)
-
-    # Annotate crew movements
     crew_movements = _compute_crew_movements(entries, cfg)
 
     return ScheduleResult(

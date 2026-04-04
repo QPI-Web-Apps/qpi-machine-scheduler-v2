@@ -6,7 +6,7 @@
 <title>QPI Machine Scheduler</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=2">
+<link rel="stylesheet" href="style.css?v=3">
 <style>/* styles in style.css */
 </style>
 </head>
@@ -50,7 +50,18 @@
 </header>
 
 <div class="machine-toggle-panel collapsed" id="machineTogglePanel">
-  <div class="mt-row" id="machineToggles"></div>
+  <div class="mg-mode-bar">
+    <div class="mg-mode-toggle">
+      <button class="mg-mode-btn active" id="modeSingle" onclick="setGroupMode('single')">Single Pool</button>
+      <button class="mg-mode-btn" id="modeMulti" onclick="setGroupMode('multi')">Crew Groups</button>
+    </div>
+  </div>
+  <div id="singleGroupMode">
+    <div class="mt-row" id="machineToggles"></div>
+  </div>
+  <div id="multiGroupMode" style="display:none;">
+    <div id="groupGrid"></div>
+  </div>
 </div>
 
 <div class="shift-config-panel collapsed" id="shiftConfigPanel">
@@ -340,9 +351,96 @@ function getInitialTools() {
   return tools;
 }
 
-// ── Machine Toggles ──────────────────────────────────
+// ── Machine Toggles & Groups ──────────────────────────
 const enabledMachines = {};
 MACHINE_ORDER.forEach(mid => { enabledMachines[mid] = true; });
+
+let groupMode = 'single';
+const GROUP_NAMES = ['A', 'B', 'C', 'D'];
+const GROUP_COLORS = { A: '#3b82f6', B: '#f59e0b', C: '#8b5cf6', D: '#22c55e' };
+let machineGroupAssignments = {}; // mid -> group name or null
+let activeGroupCount = 2;
+let groupMaxConcurrent = { A: 5, B: 5, C: 5, D: 5 };
+
+function setGroupMode(mode) {
+  groupMode = mode;
+  document.getElementById('modeSingle').className = 'mt-btn ' + (mode === 'single' ? 'on' : 'off');
+  document.getElementById('modeMulti').className = 'mt-btn ' + (mode === 'multi' ? 'on' : 'off');
+  document.getElementById('singleGroupMode').style.display = mode === 'single' ? '' : 'none';
+  document.getElementById('multiGroupMode').style.display = mode === 'multi' ? '' : 'none';
+  if (mode === 'multi') renderGroupGrid();
+}
+
+function addGroup() {
+  if (activeGroupCount < 4) { activeGroupCount++; renderGroupGrid(); }
+}
+function removeGroup() {
+  if (activeGroupCount > 2) {
+    const removed = GROUP_NAMES[activeGroupCount - 1];
+    MACHINE_ORDER.forEach(mid => { if (machineGroupAssignments[mid] === removed) machineGroupAssignments[mid] = null; });
+    activeGroupCount--;
+    renderGroupGrid();
+  }
+}
+
+function renderGroupGrid() {
+  const groups = GROUP_NAMES.slice(0, activeGroupCount);
+  let html = '';
+
+  // Group controls bar
+  html += '<div class="mg-controls">';
+  html += `<button class="mg-add-btn" onclick="addGroup()" ${activeGroupCount >= 4 ? 'disabled' : ''}>+ Group</button>`;
+  html += `<button class="mg-add-btn" onclick="removeGroup()" ${activeGroupCount <= 2 ? 'disabled' : ''}>- Group</button>`;
+  // Per-group max concurrent
+  groups.forEach(g => {
+    html += `<div class="mg-max-input"><span class="mg-max-dot" style="background:${GROUP_COLORS[g]}"></span>`;
+    html += `<span class="mg-max-label">${g} max</span>`;
+    html += `<input type="number" min="1" max="9" value="${groupMaxConcurrent[g]}" class="mg-max-field" onchange="groupMaxConcurrent['${g}']=parseInt(this.value)">`;
+    html += `</div>`;
+  });
+  html += '</div>';
+
+  // Machine assignment — each machine is a row of clickable group chips
+  html += '<div class="mg-machine-list">';
+  MACHINE_ORDER.forEach(mid => {
+    const assigned = machineGroupAssignments[mid] || null;
+    html += `<div class="mg-machine-row">`;
+    html += `<div class="mg-machine-name">${mid}</div>`;
+    html += `<div class="mg-chips">`;
+    groups.forEach(g => {
+      const isActive = assigned === g;
+      const style = isActive ? `background:${GROUP_COLORS[g]};border-color:${GROUP_COLORS[g]};color:#fff` : '';
+      html += `<button class="mg-chip ${isActive ? 'active' : ''}" style="${style}" onclick="assignMachineGroup('${mid}','${assigned === '${g}' ? null : '${g}'}')"`;
+      // Use a cleaner onclick with proper escaping
+      html = html.slice(0, html.lastIndexOf('onclick='));
+      html += `onclick="assignMachineGroup('${mid}',${assigned === g ? 'null' : "'" + g + "'"})">${g}</button>`;
+    });
+    // "Off" chip
+    const offActive = !assigned;
+    html += `<button class="mg-chip mg-chip-off ${offActive ? 'active' : ''}" onclick="assignMachineGroup('${mid}',null)">Off</button>`;
+    html += `</div></div>`;
+  });
+  html += '</div>';
+
+  document.getElementById('groupGrid').innerHTML = html;
+}
+
+function assignMachineGroup(mid, group) {
+  machineGroupAssignments[mid] = group;
+  renderGroupGrid();
+}
+
+function getMachineGroups() {
+  if (groupMode !== 'multi') return {};
+  const groups = {};
+  GROUP_NAMES.slice(0, activeGroupCount).forEach(g => {
+    const machines = MACHINE_ORDER.filter(mid => machineGroupAssignments[mid] === g);
+    if (machines.length > 0) {
+      groups[g] = { machines, max_concurrent: groupMaxConcurrent[g] || 5 };
+    }
+  });
+  return groups;
+}
 
 function renderMachineToggles() {
   const container = document.getElementById('machineToggles');
@@ -364,6 +462,9 @@ function toggleMachinePanel() {
 }
 
 function getDisabledMachines() {
+  if (groupMode === 'multi') {
+    return MACHINE_ORDER.filter(mid => !machineGroupAssignments[mid]);
+  }
   return MACHINE_ORDER.filter(mid => !enabledMachines[mid]);
 }
 
@@ -408,6 +509,10 @@ async function runSchedule() {
   formData.append('priority_boost', document.getElementById('prioBoost').checked);
   formData.append('minimize_late', document.getElementById('minimizeLate').checked);
   formData.append('disabled_machines', JSON.stringify(getDisabledMachines()));
+  const groups = getMachineGroups();
+  if (Object.keys(groups).length > 0) {
+    formData.append('machine_groups', JSON.stringify(groups));
+  }
 
   try {
     const resp = await fetch('/api/schedule', { method: 'POST', body: formData });
@@ -441,7 +546,12 @@ function saveScheduleJson() {
       minimize_late: document.getElementById('minimizeLate').checked,
       shift_config: shiftConfig,
       disabled_machines: getDisabledMachines(),
-      initial_tools: getInitialTools()
+      initial_tools: getInitialTools(),
+      group_mode: groupMode,
+      machine_groups: getMachineGroups(),
+      machine_group_assignments: machineGroupAssignments,
+      active_group_count: activeGroupCount,
+      group_max_concurrent: groupMaxConcurrent
     },
     scheduleData: scheduleData
   };
@@ -508,6 +618,13 @@ function restoreConfig(config) {
       enabledMachines[mid] = !config.disabled_machines.includes(mid);
     });
     renderMachineToggles();
+  }
+  if (config.group_mode) {
+    groupMode = config.group_mode;
+    if (config.machine_group_assignments) machineGroupAssignments = config.machine_group_assignments;
+    if (config.active_group_count) activeGroupCount = config.active_group_count;
+    if (config.group_max_concurrent) Object.assign(groupMaxConcurrent, config.group_max_concurrent);
+    setGroupMode(groupMode);
   }
 }
 
@@ -618,7 +735,22 @@ function renderDay() {
     byMachine[e.machine_id].push(e);
   });
 
-  const activeMachines = MACHINE_ORDER.filter(m => byMachine[m]);
+  let activeMachines = MACHINE_ORDER.filter(m => byMachine[m]);
+
+  // Sort by group when multi-group data exists
+  const hasGroups = scheduleData.groups && Object.keys(scheduleData.groups).length > 1;
+  const machineToGroup = {};
+  if (hasGroups) {
+    Object.entries(scheduleData.groups).forEach(([g, info]) => {
+      (info.machines || []).forEach(mid => { machineToGroup[mid] = g; });
+    });
+    const groupOrder = Object.keys(scheduleData.groups);
+    activeMachines.sort((a, b) => {
+      const ga = groupOrder.indexOf(machineToGroup[a] || '') ;
+      const gb = groupOrder.indexOf(machineToGroup[b] || '');
+      return ga - gb || MACHINE_ORDER.indexOf(a) - MACHINE_ORDER.indexOf(b);
+    });
+  }
 
   let html = '';
   html += '<div class="day-gantt">';
@@ -651,7 +783,20 @@ function renderDay() {
     html += '<div style="padding:40px;text-align:center;color:var(--text-dim);">No activity this day</div>';
   }
 
+  let prevGroup = null;
   activeMachines.forEach(mid => {
+    // Insert group separator between groups
+    if (hasGroups) {
+      const g = machineToGroup[mid] || '';
+      if (prevGroup !== null && g !== prevGroup) {
+        html += `<div class="group-separator"><span style="color:${GROUP_COLORS[g] || 'var(--text-dim)'}">Group ${g}</span></div>`;
+      }
+      if (prevGroup === null && g) {
+        html += `<div class="group-separator"><span style="color:${GROUP_COLORS[g] || 'var(--text-dim)'}">Group ${g}</span></div>`;
+      }
+      prevGroup = g;
+    }
+
     // Check if this specific machine has S3 on this day
     const dateKey = localDateStr(day);
     const machineShifts = (shiftConfig[mid] && shiftConfig[mid][dateKey]) || [1, 2];
@@ -723,9 +868,25 @@ function renderDay() {
   });
 
   // ── Crew movement arrows (SVG overlay) ──────────────
-  const headerH = 30, rulerH = 18, rowH = 44, machineColW = 52;
-  const svgH = activeMachines.length * rowH;
-  const vbW = 1000; // viewBox width maps to 100% of the track
+  const headerH = 30, rulerH = 18, rowH = 44, separatorH = 22, machineColW = 52;
+
+  // Compute actual pixel offset for each machine, accounting for group separators
+  const machineYOffset = {};
+  let yAccum = 0;
+  let arrowPrevGroup = null;
+  activeMachines.forEach(mid => {
+    if (hasGroups) {
+      const g = machineToGroup[mid] || '';
+      if (arrowPrevGroup !== null && g !== arrowPrevGroup) yAccum += separatorH;
+      if (arrowPrevGroup === null && g) yAccum += separatorH;
+      arrowPrevGroup = g;
+    }
+    machineYOffset[mid] = yAccum + rowH / 2;
+    yAccum += rowH;
+  });
+  const svgH = yAccum;
+
+  const vbW = 1000;
   const dayDateStr2 = localDateStr(day);
   const dayCrew = scheduleData.crew_movements.filter(cm => cm.time.startsWith(dayDateStr2));
 
@@ -734,18 +895,16 @@ function renderDay() {
     html += '<defs><marker id="arrow" viewBox="0 0 6 6" refX="5" refY="3" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,1 L5,3 L0,5 Z" fill="#0f172a"/></marker></defs>';
 
     dayCrew.forEach(cm => {
-      const fromIdx = activeMachines.indexOf(cm.from_machine);
-      const toIdx = activeMachines.indexOf(cm.to_machine);
-      if (fromIdx < 0 || toIdx < 0) return;
+      if (!(cm.from_machine in machineYOffset) || !(cm.to_machine in machineYOffset)) return;
 
       const cmTime = new Date(cm.time).getTime();
       const xFrac = (cmTime - dayStartMs) / (dayEndMs - dayStartMs);
       if (xFrac < 0 || xFrac > 1) return;
 
       const x = xFrac * vbW;
-      const y1 = fromIdx * rowH + rowH / 2;
-      const y2 = toIdx * rowH + rowH / 2;
-      const dx = 20; // curve offset in viewBox units
+      const y1 = machineYOffset[cm.from_machine];
+      const y2 = machineYOffset[cm.to_machine];
+      const dx = 20;
 
       html += `<path d="M ${x} ${y1} C ${x + dx} ${y1}, ${x + dx} ${y2}, ${x} ${y2}" fill="none" stroke="#0f172a" stroke-width="2" marker-end="url(#arrow)" opacity="0.7" vector-effect="non-scaling-stroke"/>`;
     });
