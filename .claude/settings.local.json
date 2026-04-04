@@ -40,7 +40,18 @@
       "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8000/style.css)",
       "Bash(curl -s http://localhost:8000/style.css)",
       "mcp__playwright__browser_evaluate",
-      "mcp__playwright__browser_run_code"
+      "mcp__playwright__browser_run_code",
+      "Bash(git stash:*)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(git push:*)",
+      "Bash(pkill -f \"uvicorn src.api:app\")",
+      "Bash(curl -s http://localhost:8000/)",
+      "Bash(curl -s -X POST http://localhost:8000/api/schedule -F 'schedule_file=@test_schedules/verify 8,20,smb,lmb 04.02 Updated \\(1\\).xlsx' -F reference_date=2026-04-02 -F reference_time=06:30)",
+      "Bash(curl -v -X POST http://localhost:8000/api/schedule -F 'schedule_file=@test_schedules/verify 8,20,smb,lmb 04.02 Updated \\(1\\).xlsx' -F reference_date=2026-04-02)",
+      "Bash(curl -s -X POST http://localhost:8000/api/schedule -F 'schedule_file=@\"test_schedules/verify 8,20,smb,lmb 04.02 Updated \\(1\\).xlsx\"' -F reference_date=2026-04-02 -F reference_time=06:30)",
+      "Bash(git commit -m ':*)",
+      "Bash(git merge:*)"
     ]
   }
 }
