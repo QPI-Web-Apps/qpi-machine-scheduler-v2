@@ -152,13 +152,15 @@ def _batch_dominant_headcount(jobs: list[dict]) -> float:
 # ── Stage 2: Build tool batches ─────────────────────────────────────
 
 def _hc_bucket(hc: float) -> str:
-    """Bucket headcount into low/mid/high for batch splitting."""
+    """Bucket headcount into low/mid/high/very_high for batch splitting."""
     if hc <= 6:
         return "low"
     elif hc <= 9:
         return "mid"
-    else:
+    elif hc <= 12:
         return "high"
+    else:
+        return "very_high"
 
 
 def build_tool_batches(
