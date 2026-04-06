@@ -30,6 +30,7 @@ class ToolBatch:
     jobs: list[dict]
     total_minutes: int  # staffed minutes
     has_in_progress: bool = False  # True if any job is currently running
+    dominant_headcount: float = 0.0  # time-weighted average HC for the batch
 
 
 @dataclass
@@ -134,14 +135,40 @@ def _assign_multi_machine_group(
         tools_on[best] += 1
 
 
+# ── Headcount helper ───────────────────────────────────────────────
+
+def _batch_dominant_headcount(jobs: list[dict]) -> float:
+    """Time-weighted average headcount for a batch's jobs."""
+    total_min = sum(max(1, round(j["run_hours"] * 60)) for j in jobs)
+    if total_min == 0:
+        return 11.0
+    weighted = sum(
+        j["headcount"] * max(1, round(j["run_hours"] * 60))
+        for j in jobs
+    )
+    return round(weighted / total_min, 1)
+
+
 # ── Stage 2: Build tool batches ─────────────────────────────────────
+
+def _hc_bucket(hc: float) -> str:
+    """Bucket headcount into low/mid/high for batch splitting."""
+    if hc <= 6:
+        return "low"
+    elif hc <= 9:
+        return "mid"
+    else:
+        return "high"
+
 
 def build_tool_batches(
     machine_jobs: dict[str, list[dict]],
 ) -> list[ToolBatch]:
-    """Group jobs by (machine, tool) into batches.
+    """Group jobs by (machine, tool, hc_bucket) into batches.
 
-    Within each batch, jobs are sorted by: priority_class ASC,
+    Jobs sharing a tool but with different headcount levels are split
+    into separate batches so the solver can sequence them with HC-aware
+    ordering.  Within each batch, jobs are sorted by: priority_class ASC,
     due_date ASC (NaT last), so_number ASC.
     """
     batches: list[ToolBatch] = []
@@ -151,33 +178,33 @@ def build_tool_batches(
         if not jobs:
             continue
 
-        # Group by tool
-        tool_groups: dict[str, list[dict]] = {}
+        # Group by (tool, hc_bucket)
+        groups: dict[tuple[str, str], list[dict]] = {}
         for job in jobs:
-            tool_groups.setdefault(job["tool_id"], []).append(job)
+            key = (job["tool_id"], _hc_bucket(job["headcount"]))
+            groups.setdefault(key, []).append(job)
 
-        spec = MACHINE_BY_ID[machine_id]
-
-        for tool_id, tool_jobs in tool_groups.items():
+        for (tool_id, _bucket), group_jobs in groups.items():
             # Sort within batch
-            tool_jobs.sort(key=lambda j: (
+            group_jobs.sort(key=lambda j: (
                 j["priority_class"],
                 j["due_date"] or datetime.max,
                 j["so_number"],
             ))
 
-            total_hrs = sum(j["run_hours"] for j in tool_jobs)
+            total_hrs = sum(j["run_hours"] for j in group_jobs)
             total_min = max(1, round(total_hrs * 60))
 
-            has_ip = any(j.get("is_in_progress") for j in tool_jobs)
+            has_ip = any(j.get("is_in_progress") for j in group_jobs)
 
             batches.append(ToolBatch(
                 batch_id=batch_id,
                 machine_id=machine_id,
                 tool_id=tool_id,
-                jobs=tool_jobs,
+                jobs=group_jobs,
                 total_minutes=total_min,
                 has_in_progress=has_ip,
+                dominant_headcount=_batch_dominant_headcount(group_jobs),
             ))
             batch_id += 1
 
@@ -237,66 +264,81 @@ def solve_schedule(
         if b.has_in_progress:
             model.add(starts[b.batch_id] == 0)
 
-    # ── No-overlap per machine + changeover gaps ────────────────
+    # ── No-overlap per machine (circuit constraint) ────────────
+    #
+    # Each machine's batches are sequenced via a circuit (Hamiltonian
+    # path through a depot node).  Arc literals give "immediate
+    # predecessor" identity, enabling:
+    #   - Tool changeover gaps (time constraint on arcs)
+    #   - Headcount transition penalties (soft cost in objective)
+    #   - Initial tool handling (changeover if first batch differs)
 
-    # Group batches by machine
     machine_batches: dict[str, list[ToolBatch]] = {}
     for b in batches:
         machine_batches.setdefault(b.machine_id, []).append(b)
 
-    # ── Initial tool changeover constraints ────────────────────
-    # If a machine has a known last tool, any first batch with a different
-    # tool must start after the changeover duration.
-    if cfg.initial_tools:
-        for machine_id, init_tool in cfg.initial_tools.items():
-            if machine_id not in machine_batches:
-                continue
-            m_batches_it = machine_batches[machine_id]
-            # Skip if machine has in-progress batch (already running)
-            if any(b.has_in_progress for b in m_batches_it):
-                continue
-            spec = MACHINE_BY_ID[machine_id]
-            if not spec.has_changeovers:
-                continue
-            co_min = round(spec.changeover_hours * 60)
-            for b in m_batches_it:
-                if b.tool_id != init_tool:
-                    model.add(starts[b.batch_id] >= co_min)
+    hc_penalty_terms: list[tuple] = []  # (literal, penalty_value)
 
-    # For each machine, add no-overlap and changeover constraints
     for machine_id, m_batches in machine_batches.items():
-        if len(m_batches) <= 1:
+        if not m_batches:
             continue
 
-        # Machine-level changeover cost (same for all batch pairs on this machine)
         spec = MACHINE_BY_ID[machine_id]
         machine_co = round(spec.changeover_hours * 60) if spec.has_changeovers else 0
+        init_tool = cfg.initial_tools.get(machine_id)
+        has_ip = any(b.has_in_progress for b in m_batches)
 
-        # No-overlap: handled via pairwise ordering
-        for i, bi in enumerate(m_batches):
-            for bj in m_batches[i + 1:]:
-                # Boolean: does bi come before bj?
-                bi_before_bj = model.new_bool_var(
-                    f"order_{bi.batch_id}_{bj.batch_id}"
+        n = len(m_batches)
+        arcs: list[tuple[int, int, cp_model.IntVar]] = []
+
+        for i in range(n):
+            bi = m_batches[i]
+
+            # Arc: depot (0) → batch i+1 — batch i is first on this machine
+            first_lit = model.new_bool_var(f"first_{machine_id}_{bi.batch_id}")
+            arcs.append((0, i + 1, first_lit))
+
+            # Force in-progress batch to be first
+            if bi.has_in_progress:
+                model.add(first_lit == 1)
+
+            # Initial tool changeover: if this batch is first and its tool
+            # differs from the tool already loaded, it must wait for a changeover.
+            if (init_tool and init_tool != bi.tool_id
+                    and machine_co > 0 and not has_ip):
+                model.add(
+                    starts[bi.batch_id] >= machine_co
+                ).only_enforce_if(first_lit)
+
+            # Arc: batch i+1 → depot (0) — batch i is last
+            last_lit = model.new_bool_var(f"last_{machine_id}_{bi.batch_id}")
+            arcs.append((i + 1, 0, last_lit))
+
+            # Arcs: batch i → batch j (i immediately precedes j)
+            for j in range(n):
+                if i == j:
+                    continue
+                bj = m_batches[j]
+
+                lit = model.new_bool_var(
+                    f"seq_{machine_id}_{bi.batch_id}_then_{bj.batch_id}"
                 )
+                arcs.append((i + 1, j + 1, lit))
 
-                # Gap between consecutive batches with different tools
-                if bi.tool_id != bj.tool_id:
-                    gap_ij = machine_co   # bi finishes → changeover → bj starts
-                    gap_ji = machine_co   # bj finishes → changeover → bi starts
-                else:
-                    gap_ij = 0
-                    gap_ji = 0
-
-                # If bi before bj: end[bi] + gap_ij <= start[bj]
+                # Time gap: changeover if different tools
+                gap = machine_co if bi.tool_id != bj.tool_id else 0
                 model.add(
-                    ends[bi.batch_id] + gap_ij <= starts[bj.batch_id]
-                ).only_enforce_if(bi_before_bj)
+                    starts[bj.batch_id] >= ends[bi.batch_id] + gap
+                ).only_enforce_if(lit)
 
-                # If bj before bi: end[bj] + gap_ji <= start[bi]
-                model.add(
-                    ends[bj.batch_id] + gap_ji <= starts[bi.batch_id]
-                ).only_enforce_if(~bi_before_bj)
+                # HC transition penalty (collected for objective)
+                if cfg.hc_penalty_weight > 0:
+                    hc_delta = abs(bi.dominant_headcount - bj.dominant_headcount)
+                    if hc_delta > 0.5:
+                        penalty = int(round(hc_delta * cfg.hc_penalty_weight))
+                        hc_penalty_terms.append((lit, penalty))
+
+        model.add_circuit(arcs)
 
     # ── Max concurrent machines (cumulative) ────────────────────
 
@@ -312,7 +354,7 @@ def solve_schedule(
     # Layer 1 (highest): late job count        (minimize_late only)
     # Layer 2:           total tardiness        (minimize_late only)
     # Layer 3:           priority start penalty (priority_boost / picked)
-    # Layer 4 (lowest):  makespan
+    # Layer 4 (lowest):  makespan + HC transition penalty
 
     makespan = model.new_int_var(0, horizon, "makespan")
     for b in batches:
@@ -383,15 +425,20 @@ def solve_schedule(
         if any(j.get("is_picked") for j in b.jobs) and not b.has_in_progress:
             prio_term += 3 * starts[b.batch_id]
 
+    # ── Layer 4b: HC transition penalty ──────────────────────────
+    hc_term = 0
+    if hc_penalty_terms:
+        hc_term = sum(lit * pen for lit, pen in hc_penalty_terms)
+
     # ── Combine layers ─────────────────────────────────────────
-    # late_term >> prio_term >> makespan
+    # late_term >> prio_term >> makespan + hc_term
     # Scale prio_term above makespan but below late_term
     has_prio = cfg.priority_boost or any(
         any(j.get("is_picked") for j in b.jobs) for b in batches
     )
     has_late = cfg.minimize_late and (late_vars or tardiness_vars)
 
-    objective = makespan
+    objective = makespan + hc_term
     if has_prio:
         objective += prio_term * n_batches
     if has_late:

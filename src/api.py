@@ -256,6 +256,7 @@ async def create_schedule(
     priority_boost: bool = Form(default=False),
     minimize_late: bool = Form(default=False),
     disabled_machines: str = Form(default=""),
+    hc_penalty_weight: float = Form(default=30),
     machine_groups: str = Form(default=""),
 ):
     """Upload Excel, generate schedule, return JSON."""
@@ -285,6 +286,7 @@ async def create_schedule(
         priority_boost=priority_boost,
         minimize_late=minimize_late,
         disabled_machines=disabled_machines_list,
+        hc_penalty_weight=hc_penalty_weight,
     )
 
     # Parse per-machine-per-day shift config if provided
