@@ -46,6 +46,7 @@ class SchedulerConfig:
     priority_boost: bool = False
     minimize_late: bool = False
     hc_penalty_weight: float = 30  # minutes-equivalent cost per HC unit of change
+    total_crew: int = 0  # max total headcount across concurrent jobs (0 = unlimited)
 
     def get_day_shift_map(self, machine_id: str):
         """Return per-day shift map for a machine, or int fallback."""

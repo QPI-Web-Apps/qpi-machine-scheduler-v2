@@ -348,6 +348,14 @@ def solve_schedule(
     all_demands = [1] * len(batches)
     model.add_cumulative(all_intervals, all_demands, max_concurrent)
 
+    # ── Crew headcount capacity (cumulative) ────────────────────
+    # Prevents the solver from scheduling more total headcount
+    # than the available workforce across concurrent batches.
+
+    if cfg.total_crew > 0:
+        hc_demands = [max(1, int(round(b.dominant_headcount))) for b in batches]
+        model.add_cumulative(all_intervals, hc_demands, cfg.total_crew)
+
     # ── Objective ────────────────────────────────────────────────
     #
     # All terms are composable and scaled relative to the horizon so

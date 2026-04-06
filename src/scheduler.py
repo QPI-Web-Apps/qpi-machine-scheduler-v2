@@ -435,23 +435,15 @@ def _rebuild_idle_gaps(
 
 # ── Crew movement annotation ───────────────────────────────────────
 
-def _compute_crew_movements(
-    entries: list[ScheduleEntry], cfg: SchedulerConfig
-) -> list[CrewMovement]:
-    """Walk the schedule chronologically and track crew movements.
+def _collect_crew_events(
+    entries: list[ScheduleEntry],
+) -> tuple[list[tuple], list[ScheduleEntry]]:
+    """Collect freed-crew events and target job starts.
 
-    Crew is freed in two scenarios:
-    1. A CHANGEOVER starts — the operator is no longer needed on that machine.
-    2. A machine's last job ends with no follow-on work (no next job/changeover).
-
-    All freed-crew events are collected, sorted chronologically, then processed
-    in order so each crew claims the nearest *unclaimed* target job.
+    Returns (freed_events, job_starts) where:
+    - freed_events: [(freed_time, freed_machine, hc, reason, source_entry), ...]
+    - job_starts: [ScheduleEntry, ...] jobs that need external crew
     """
-    movements: list[CrewMovement] = []
-
-    # Collect job starts that actually need crew from another machine.
-    # A job preceded by another JOB on the same machine already has crew
-    # (crew carries over), so it should not be a candidate for crew jumps.
     by_machine: dict[str, list[ScheduleEntry]] = {}
     for e in entries:
         by_machine.setdefault(e.machine_id, []).append(e)
@@ -464,9 +456,6 @@ def _compute_crew_movements(
             if e.entry_type != "JOB":
                 continue
             prev = m_entries[i - 1] if i > 0 else None
-            # Job needs external crew if it's the first entry, or preceded by
-            # a CHANGEOVER or NOT_RUNNING.  TOOL_SWAP is self-service — crew
-            # stays on the machine and continues into the next job.
             if prev is None or prev.entry_type not in ("JOB", "TOOL_SWAP"):
                 needs_crew.add((e.machine_id, e.start))
 
@@ -475,11 +464,8 @@ def _compute_crew_movements(
         if e.entry_type == "JOB" and (e.machine_id, e.start) in needs_crew
     ]
 
-    # ── Collect all "crew freed" events ──────────────────────────────
-    # Each event: (freed_time, freed_machine, headcount, reason, source_entry)
     freed_events: list[tuple[datetime, str, float, str, Optional[ScheduleEntry]]] = []
 
-    # From changeovers
     for co in entries:
         if co.entry_type != "CHANGEOVER":
             continue
@@ -493,7 +479,6 @@ def _compute_crew_movements(
         if hc:
             freed_events.append((co.start, co.machine_id, hc, "changeover", co))
 
-    # From end-of-work (job followed by nothing, NOT_RUNNING, or TOOL_SWAP)
     for machine_id, m_entries in by_machine.items():
         for i, e in enumerate(m_entries):
             if e.entry_type != "JOB":
@@ -504,21 +489,253 @@ def _compute_crew_movements(
                 if hc:
                     freed_events.append((e.end, machine_id, hc, "end_of_work", e))
             elif next_entry.entry_type == "TOOL_SWAP":
-                # Self-service: crew does the swap themselves.
-                # Only free crew if there's no follow-on job after the swap
-                # (crew stays on the machine to run the next batch).
                 after_swap = m_entries[i + 2] if i + 2 < len(m_entries) else None
                 if after_swap is None or after_swap.entry_type != "JOB":
                     hc = e.headcount or 0
                     if hc:
                         freed_events.append((next_entry.end, machine_id, hc, "end_of_work", next_entry))
 
-    # ── Match freed crew to targets by best score, not chronologically ─
-    # Pre-compute the best candidate for each freed event, then process
-    # in score order so the tightest matches are assigned first.  This
-    # prevents an early-freed crew (e.g. SMB at 18:14) from claiming a
-    # target that a later-freed crew (e.g. 8 at 20:03) is a near-perfect
-    # match for.
+    return freed_events, job_starts
+
+
+def _build_feasible_pairings(
+    freed_events: list[tuple], job_starts: list[ScheduleEntry],
+) -> list[list[int]]:
+    """For each freed event, list indices of feasible target job starts.
+
+    Returns feasible[i] = [target_index, ...] for freed_events[i].
+    """
+    tolerance = timedelta(minutes=30)
+    window = timedelta(hours=3)
+
+    feasible: list[list[int]] = []
+    for freed_time, freed_machine, hc, reason, source_entry in freed_events:
+        targets = []
+        for j, e in enumerate(job_starts):
+            if (e.machine_id != freed_machine
+                    and e.start >= freed_time - tolerance
+                    and e.start <= freed_time + window):
+                targets.append(j)
+        feasible.append(targets)
+    return feasible
+
+
+def _apply_assignments(
+    assignments: list[int],  # assignments[i] = target index or -1
+    freed_events: list[tuple],
+    job_starts: list[ScheduleEntry],
+) -> list[CrewMovement]:
+    """Convert an assignment vector to CrewMovement list and annotate entries."""
+    movements: list[CrewMovement] = []
+    for i, target_idx in enumerate(assignments):
+        if target_idx < 0:
+            continue
+        freed_time, freed_machine, hc, reason, source_entry = freed_events[i]
+        target = job_starts[target_idx]
+
+        if source_entry:
+            source_entry.crew_to = target.machine_id
+        target.crew_from = freed_machine
+
+        movements.append(CrewMovement(
+            time=target.start,
+            from_machine=freed_machine,
+            to_machine=target.machine_id,
+            headcount=hc,
+            reason=reason,
+        ))
+
+    movements.sort(key=lambda m: m.time)
+    return movements
+
+
+def _score_assignment(
+    assignments: list[int],
+    freed_events: list[tuple],
+    job_starts: list[ScheduleEntry],
+    feasible: list[list[int]],
+) -> tuple[float, float, float]:
+    """Score an assignment vector on three objectives (all minimize).
+
+    Returns (idle_time, ping_pong_count, hc_mismatch).
+    """
+    total_idle = 0.0
+    total_hc_mismatch = 0.0
+    ping_pongs = 0
+
+    # Track flows for ping-pong detection
+    flows: list[tuple[str, str, datetime]] = []  # (from, to, time)
+
+    for i, target_idx in enumerate(assignments):
+        if target_idx < 0:
+            # Unassigned freed crew = wasted idle
+            total_idle += 3600.0  # 1-hour penalty for unassigned
+            continue
+
+        freed_time, freed_machine, hc, reason, source_entry = freed_events[i]
+        target = job_starts[target_idx]
+
+        # Idle time: gap between freed and target start
+        idle_sec = abs((target.start - freed_time).total_seconds())
+        total_idle += idle_sec
+
+        # HC mismatch
+        target_hc = target.headcount or hc
+        total_hc_mismatch += abs(hc - target_hc)
+
+        flows.append((freed_machine, target.machine_id, freed_time))
+
+    # Count ping-pongs: A→B followed by B→A within 2 hours
+    for i, (f1, t1, time1) in enumerate(flows):
+        for f2, t2, time2 in flows[i + 1:]:
+            if (f1 == t2 and t1 == f2
+                    and abs((time2 - time1).total_seconds()) < 7200):
+                ping_pongs += 1
+
+    return total_idle, float(ping_pongs), total_hc_mismatch
+
+
+def _optimize_crew_pymoo(
+    freed_events: list[tuple],
+    job_starts: list[ScheduleEntry],
+    feasible: list[list[int]],
+) -> list[int]:
+    """Use pymoo NSGA-II to find Pareto-optimal crew assignments.
+
+    Falls back to greedy if pymoo fails or problem is trivial.
+    """
+    try:
+        import numpy as np
+        from pymoo.algorithms.moo.nsga2 import NSGA2
+        from pymoo.core.problem import Problem
+        from pymoo.core.sampling import Sampling
+        from pymoo.core.crossover import Crossover
+        from pymoo.core.mutation import Mutation
+        from pymoo.optimize import minimize as pymoo_minimize
+    except ImportError:
+        return _greedy_assignment(freed_events, job_starts, feasible)
+
+    n_sources = len(freed_events)
+    n_targets = len(job_starts)
+
+    if n_sources == 0 or n_targets == 0:
+        return [-1] * n_sources
+
+    # ── Custom operators for integer assignment vectors ──────────
+
+    class CrewSampling(Sampling):
+        def _do(self, problem, n_samples, **kwargs):
+            X = np.full((n_samples, n_sources), -1, dtype=int)
+            for s in range(n_samples):
+                used_targets = set()
+                order = list(range(n_sources))
+                np.random.shuffle(order)
+                for i in order:
+                    candidates = [t for t in feasible[i] if t not in used_targets]
+                    if candidates:
+                        t = candidates[np.random.randint(len(candidates))]
+                        X[s, i] = t
+                        used_targets.add(t)
+            return X
+
+    class CrewCrossover(Crossover):
+        def __init__(self):
+            super().__init__(n_parents=2, n_offsprings=2)
+
+        def _do(self, problem, X, **kwargs):
+            n_matings = X.shape[0]
+            Y = np.full((n_matings, 2, n_sources), -1, dtype=int)
+            for k in range(n_matings):
+                p1, p2 = X[k, 0], X[k, 1]
+                # Uniform crossover with feasibility repair
+                for off in range(2):
+                    child = np.full(n_sources, -1, dtype=int)
+                    used = set()
+                    order = list(range(n_sources))
+                    np.random.shuffle(order)
+                    for i in order:
+                        parent_val = p1[i] if (np.random.random() < 0.5) else p2[i]
+                        if parent_val >= 0 and parent_val in feasible[i] and parent_val not in used:
+                            child[i] = parent_val
+                            used.add(parent_val)
+                        else:
+                            candidates = [t for t in feasible[i] if t not in used]
+                            if candidates:
+                                child[i] = candidates[np.random.randint(len(candidates))]
+                                used.add(child[i])
+                    Y[k, off] = child
+            return Y
+
+    class CrewMutation(Mutation):
+        def _do(self, problem, X, **kwargs):
+            for i in range(X.shape[0]):
+                if np.random.random() < 0.3:
+                    # Pick a random source and reassign it
+                    src = np.random.randint(n_sources)
+                    used = set(X[i]) - {-1, X[i, src]}
+                    candidates = [t for t in feasible[src] if t not in used]
+                    if candidates:
+                        X[i, src] = candidates[np.random.randint(len(candidates))]
+                    else:
+                        X[i, src] = -1
+            return X
+
+    class CrewProblem(Problem):
+        def __init__(self):
+            super().__init__(
+                n_var=n_sources,
+                n_obj=3,
+                xl=-1,
+                xu=n_targets - 1,
+            )
+
+        def _evaluate(self, X, out, *args, **kwargs):
+            F = np.zeros((X.shape[0], 3))
+            for k in range(X.shape[0]):
+                assignments = X[k].astype(int).tolist()
+                F[k] = _score_assignment(
+                    assignments, freed_events, job_starts, feasible
+                )
+            out["F"] = F
+
+    algorithm = NSGA2(
+        pop_size=50,
+        sampling=CrewSampling(),
+        crossover=CrewCrossover(),
+        mutation=CrewMutation(),
+        eliminate_duplicates=True,
+    )
+
+    result = pymoo_minimize(
+        CrewProblem(),
+        algorithm,
+        termination=("n_gen", 80),
+        seed=42,
+        verbose=False,
+    )
+
+    if result.X is None:
+        return _greedy_assignment(freed_events, job_starts, feasible)
+
+    # Pick solution with lowest ping-pong count, then lowest idle time
+    F = result.F
+    best_idx = 0
+    best_key = (F[0, 1], F[0, 0], F[0, 2])  # (ping_pong, idle, hc_mismatch)
+    for k in range(1, F.shape[0]):
+        key = (F[k, 1], F[k, 0], F[k, 2])
+        if key < best_key:
+            best_key = key
+            best_idx = k
+
+    return result.X[best_idx].astype(int).tolist()
+
+
+def _greedy_assignment(
+    freed_events: list[tuple],
+    job_starts: list[ScheduleEntry],
+    feasible: list[list[int]],
+) -> list[int]:
+    """Greedy fallback: assign by best score with anti-ping-pong."""
     tolerance = timedelta(minutes=30)
     window = timedelta(hours=3)
     max_window_sec = window.total_seconds()
@@ -529,60 +746,61 @@ def _compute_crew_movements(
         hc_gap = abs(hc - target_hc) / max(hc, 1)
         return time_score + hc_gap * 0.1
 
-    # Build (score, freed_event_index, target) for every possible pairing
-    pairings: list[tuple[float, int, ScheduleEntry]] = []
-    for idx, (freed_time, freed_machine, hc, reason, source_entry) in enumerate(freed_events):
-        for e in job_starts:
-            if (e.machine_id != freed_machine
-                    and e.start >= freed_time - tolerance
-                    and e.start <= freed_time + window):
-                pairings.append((_score(freed_time, hc, e), idx, e))
+    # Build scored pairings
+    pairings: list[tuple[float, int, int]] = []  # (score, freed_idx, target_idx)
+    for i, (freed_time, freed_machine, hc, reason, source_entry) in enumerate(freed_events):
+        for j in feasible[i]:
+            pairings.append((_score(freed_time, hc, job_starts[j]), i, j))
 
-    # Sort by score (best matches first) and greedily assign
     pairings.sort(key=lambda p: p[0])
 
-    used_sources: set[int] = set()              # freed event indices
-    claimed_targets: set[tuple[str, datetime]] = set()
-
-    # Anti-ping-pong: track recent crew flows so we don't send crew
-    # back to the machine they just came from (A→B then B→A).
-    # Key: (from_machine, to_machine) → time of movement
+    assignments = [-1] * len(freed_events)
+    used_targets: set[int] = set()
     recent_flows: dict[tuple[str, str], datetime] = {}
     ping_pong_window = timedelta(hours=2)
 
-    for _score_val, idx, target in pairings:
-        if idx in used_sources:
+    for _score_val, idx, target_idx in pairings:
+        if assignments[idx] >= 0:
             continue
-        if (target.machine_id, target.start) in claimed_targets:
+        if target_idx in used_targets:
             continue
 
         freed_time, freed_machine, hc, reason, source_entry = freed_events[idx]
+        target = job_starts[target_idx]
 
-        # Skip if this would create a ping-pong (reverse of a recent flow)
         reverse_key = (target.machine_id, freed_machine)
         if reverse_key in recent_flows:
             prev_time = recent_flows[reverse_key]
             if abs((freed_time - prev_time).total_seconds()) < ping_pong_window.total_seconds():
-                continue  # skip, try next best pairing
+                continue
 
-        # Anchor the arrow to the target job's start
-        move_time = target.start
-
-        if source_entry:
-            source_entry.crew_to = target.machine_id
-        target.crew_from = freed_machine
-
-        used_sources.add(idx)
-        claimed_targets.add((target.machine_id, target.start))
+        assignments[idx] = target_idx
+        used_targets.add(target_idx)
         recent_flows[(freed_machine, target.machine_id)] = freed_time
 
-        movements.append(CrewMovement(
-            time=move_time,
-            from_machine=freed_machine,
-            to_machine=target.machine_id,
-            headcount=hc,
-            reason=reason,
-        ))
+    return assignments
 
-    movements.sort(key=lambda m: m.time)
-    return movements
+
+def _compute_crew_movements(
+    entries: list[ScheduleEntry], cfg: SchedulerConfig
+) -> list[CrewMovement]:
+    """Optimized crew movement assignment.
+
+    Uses pymoo NSGA-II multi-objective optimizer to find crew assignments
+    that minimize idle time, ping-pong movements, and HC mismatch.
+    Falls back to greedy assignment if pymoo is unavailable.
+    """
+    freed_events, job_starts = _collect_crew_events(entries)
+
+    if not freed_events or not job_starts:
+        return []
+
+    feasible = _build_feasible_pairings(freed_events, job_starts)
+
+    # Try pymoo optimizer, fall back to greedy
+    try:
+        assignments = _optimize_crew_pymoo(freed_events, job_starts, feasible)
+    except Exception:
+        assignments = _greedy_assignment(freed_events, job_starts, feasible)
+
+    return _apply_assignments(assignments, freed_events, job_starts)
