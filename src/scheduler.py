@@ -319,24 +319,39 @@ def _stagger_changeovers(
     # placed first and flexible ones can slide around them.
     cos.sort(key=lambda x: (x[2] - x[1]) - x[3])
 
-    # Greedily place each changeover at the earliest non-conflicting time
+    # Greedily place each changeover at the earliest non-conflicting time.
+    # A spacing buffer between consecutive changeovers gives crew time
+    # to settle into their new assignment before the next disruption.
     placed: list[tuple[datetime, datetime]] = []
+    spacing_buffer = timedelta(minutes=30)
 
     for co_entry, window_start, window_end, duration in cos:
         candidate = window_start
 
-        # Slide past any conflicting already-placed changeover
+        # Slide past any conflicting already-placed changeover (+ buffer)
         changed = True
         while changed:
             changed = False
             for p_start, p_end in placed:
-                if candidate < p_end and (candidate + duration) > p_start:
-                    candidate = p_end
+                buffered_end = p_end + spacing_buffer
+                if candidate < buffered_end and (candidate + duration) > p_start:
+                    candidate = buffered_end
                     changed = True
 
-        # Check if it still fits in the window
+        # Check if it still fits in the window (fall back without buffer)
         if candidate + duration > window_end + timedelta(minutes=2):
-            candidate = co_entry.start  # can't fit, keep original
+            # Try again without buffer — better to have tight changeovers
+            # than to give up on staggering entirely
+            candidate = window_start
+            changed = True
+            while changed:
+                changed = False
+                for p_start, p_end in placed:
+                    if candidate < p_end and (candidate + duration) > p_start:
+                        candidate = p_end
+                        changed = True
+            if candidate + duration > window_end + timedelta(minutes=2):
+                candidate = co_entry.start  # can't fit at all, keep original
 
         co_entry.start = candidate
         co_entry.end = candidate + duration
@@ -529,6 +544,12 @@ def _compute_crew_movements(
     used_sources: set[int] = set()              # freed event indices
     claimed_targets: set[tuple[str, datetime]] = set()
 
+    # Anti-ping-pong: track recent crew flows so we don't send crew
+    # back to the machine they just came from (A→B then B→A).
+    # Key: (from_machine, to_machine) → time of movement
+    recent_flows: dict[tuple[str, str], datetime] = {}
+    ping_pong_window = timedelta(hours=2)
+
     for _score_val, idx, target in pairings:
         if idx in used_sources:
             continue
@@ -536,6 +557,13 @@ def _compute_crew_movements(
             continue
 
         freed_time, freed_machine, hc, reason, source_entry = freed_events[idx]
+
+        # Skip if this would create a ping-pong (reverse of a recent flow)
+        reverse_key = (target.machine_id, freed_machine)
+        if reverse_key in recent_flows:
+            prev_time = recent_flows[reverse_key]
+            if abs((freed_time - prev_time).total_seconds()) < ping_pong_window.total_seconds():
+                continue  # skip, try next best pairing
 
         # Anchor the arrow to the target job's start
         move_time = target.start
@@ -546,6 +574,7 @@ def _compute_crew_movements(
 
         used_sources.add(idx)
         claimed_targets.add((target.machine_id, target.start))
+        recent_flows[(freed_machine, target.machine_id)] = freed_time
 
         movements.append(CrewMovement(
             time=move_time,

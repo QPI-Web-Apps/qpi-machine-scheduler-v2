@@ -157,7 +157,7 @@ def _hc_bucket(hc: float) -> str:
         return "low"
     elif hc <= 9:
         return "mid"
-    elif hc <= 12:
+    elif hc <= 11:
         return "high"
     else:
         return "very_high"
