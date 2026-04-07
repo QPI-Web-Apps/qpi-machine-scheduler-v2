@@ -8,3 +8,13 @@ build/
 .venv/
 .playwright-mcp/
 screenshots/
+
+# Local Claude Code config — per-developer tool permissions, not project state
+.claude/
+
+# Meeting transcripts — dev reference, not source
+*.srt
+
+# Local logs
+*.log
+
