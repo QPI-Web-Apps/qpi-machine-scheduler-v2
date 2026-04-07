@@ -1,0 +1,274 @@
+generator client {
+  provider                  = "prisma-client-py"
+  interface                 = "sync"
+  recursive_type_depth      = "5"
+  enable_experimental_decimal = "true"
+}
+
+datasource db {
+  provider = "sqlserver"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// Scheduler-owned tables.
+//
+// Requested by Matt in the 2026-04-03 meeting (STF-Schedule-saving-discussion).
+// Both populated by a single "Publish Schedule" button click, wrapped in one
+// transaction so the processed_indicator state is never half-y / half-n.
+//
+// processed_indicator: Y/N pattern copied from po_acknowledgement /
+// po_line_item. 'y' = rows from the most recent publish, 'n' = historical.
+// On each publish: UPDATE all rows to 'n', then INSERT new rows with 'y'.
+//
+// Naming: scheduler_* prefix to avoid collision with the two other projects
+// that share Portal_QPI (replenishment + PO acknowledgement portal).
+// ============================================================================
+
+model scheduler_yellow_pink_jobs {
+  id                  Int       @id @default(autoincrement())
+  published_at        DateTime  @db.DateTime2
+  so_number           String    @db.NVarChar(50)
+  part_number         String?   @db.NVarChar(100)
+  description         String?   @db.NVarChar(500)
+  tool_id             String?   @db.NVarChar(50)
+  machine             String?   @db.NVarChar(20)
+  due_date            DateTime? @db.Date
+  scheduled_start     DateTime? @db.DateTime2
+  ticket_color        String    @db.NVarChar(20)
+  job_type            String?   @db.NVarChar(50)
+  processed_indicator String    @default("n") @db.NVarChar(1)
+
+  @@index([processed_indicator])
+  @@index([published_at])
+}
+
+model scheduler_published_schedule {
+  id                  Int       @id @default(autoincrement())
+  published_at        DateTime  @db.DateTime2
+  machine_id          String    @db.NVarChar(20)
+  entry_type          String    @db.NVarChar(20)
+  start_time          DateTime  @db.DateTime2
+  end_time            DateTime  @db.DateTime2
+  shift               Int?      @db.SmallInt
+  machine_group       String?   @db.NVarChar(50)
+  tool_id             String?   @db.NVarChar(50)
+  so_number           String?   @db.NVarChar(50)
+  finished_item       String?   @db.NVarChar(100)
+  description         String?   @db.NVarChar(500)
+  customer            String?   @db.NVarChar(255)
+  remaining_qty       Decimal?  @db.Decimal(12, 2)
+  run_hours           Decimal?  @db.Decimal(8, 2)
+  headcount           Decimal?  @db.Decimal(5, 2)
+  due_date            DateTime? @db.Date
+  priority_class      Int?      @db.SmallInt
+  ticket_color        String?   @db.NVarChar(20)
+  is_labeler          Boolean?
+  is_bagger           Boolean?
+  is_in_progress      Boolean?
+  is_picked           Boolean?
+  crew_from           String?   @db.NVarChar(20)
+  crew_to             String?   @db.NVarChar(20)
+  idle_type           String?   @db.NVarChar(20)
+  processed_indicator String    @default("n") @db.NVarChar(1)
+
+  @@index([processed_indicator])
+  @@index([published_at])
+  @@index([machine_id, start_time])
+}
+
+model active_session {
+  id            Int      @id @default(autoincrement())
+  session_token String   @unique @db.NVarChar(255)
+  user_name     String?  @db.NVarChar(100)
+  created_at    DateTime @default(now())
+}
+
+model box_types {
+  id               Int       @id(map: "PK__box_type__3213E83F9BA0EABA") @default(autoincrement())
+  box_part_number  String    @unique(map: "UQ__box_type__328186A51AEDCD9E") @db.NVarChar(50)
+  box_height       Decimal   @db.Decimal(10, 2)
+  boxes_per_layer  Int
+  boxes_per_pallet Int
+  created_at       DateTime? @default(now(), map: "DF__box_types__creat__3D2915A8")
+  parts            parts[]
+}
+
+model inventory {
+  id                   Int       @id(map: "PK__inventor__3213E83FB615DA67") @default(autoincrement())
+  part_id              Int       @unique(map: "UQ__inventor__A0E3FAB90EDDADC8")
+  on_hand_qty          Int?      @default(0, map: "DF__inventory__on_ha__7D439ABD")
+  last_updated         DateTime? @default(now(), map: "DF__inventory__last___4A8310C6")
+  confirmed_replen_qty Int?      @default(0)
+  parts                parts     @relation(fields: [part_id], references: [id], onUpdate: NoAction, map: "FK_inventory_part")
+
+  @@index([part_id], map: "IX_inventory_part_id")
+}
+
+model order_releases {
+  id                 Int     @id(map: "PK__order_re__3213E83F0E53FD25") @default(autoincrement())
+  order_id           Int
+  part_id            Int
+  release_qty        Int
+  boxes              Int
+  pallet_assignments String? @db.NVarChar(Max)
+  orders             orders  @relation(fields: [order_id], references: [id], onUpdate: NoAction, map: "FK_order_releases_order")
+  parts              parts   @relation(fields: [part_id], references: [id], onUpdate: NoAction, map: "FK_order_releases_part")
+
+  @@index([order_id], map: "IX_order_releases_order_id")
+  @@index([part_id], map: "IX_order_releases_part_id")
+}
+
+model order_replens {
+  id         Int      @id(map: "PK__order_re__3213E83FFA06AC87") @default(autoincrement())
+  order_id   Int
+  part_id    Int
+  replen_qty Int
+  unit_cost  Decimal? @db.Decimal(10, 4)
+  orders     orders   @relation(fields: [order_id], references: [id], onUpdate: NoAction, map: "FK_order_replens_order")
+  parts      parts    @relation(fields: [part_id], references: [id], onUpdate: NoAction, map: "FK_order_replens_part")
+
+  @@index([order_id], map: "IX_order_replens_order_id")
+  @@index([part_id], map: "IX_order_replens_part_id")
+}
+
+model orders {
+  id                 Int                @id(map: "PK__orders__3213E83FA90810EB") @default(autoincrement())
+  po_number          String             @db.NVarChar(100)
+  ship_to_id         Int
+  status             String?            @default("pending", map: "DF__orders__status__05D8E0BE") @db.NVarChar(50)
+  total_pallets      Int?
+  total_weight       Decimal?           @db.Decimal(10, 2)
+  total_replen_cost  Decimal?           @db.Decimal(12, 2)
+  created_at         DateTime?          @default(now(), map: "DF__orders__created___531856C7")
+  synced_at          DateTime?
+  total_release_cost Decimal?           @db.Decimal(12, 2)
+  order_releases     order_releases[]
+  order_replens      order_replens[]
+  ship_addresses     ship_addresses     @relation(fields: [ship_to_id], references: [id], onUpdate: NoAction, map: "FK_orders_ship_to")
+  pallet             pallet[]
+  pallet_breakdown   pallet_breakdown[]
+
+  @@index([ship_to_id], map: "IX_orders_ship_to_id")
+  @@index([status], map: "IX_orders_status")
+}
+
+model pallet {
+  id            Int            @id @default(autoincrement())
+  order_id      Int?
+  pallet_number Int?
+  pallet_weight Int?
+  pallet_height Int?
+  orders        orders?        @relation(fields: [order_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  pallet_parts  pallet_parts[]
+
+  @@index([order_id])
+}
+
+model pallet_breakdown {
+  id            Int    @id @default(autoincrement())
+  order_id      Int
+  pallet_number Int
+  part_id       Int
+  total_qty     Int
+  box_count     Int
+  orders        orders @relation(fields: [order_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  parts         parts  @relation(fields: [part_id], references: [id], onUpdate: NoAction)
+
+  @@index([order_id])
+  @@index([pallet_number])
+}
+
+model pallet_parts {
+  id        Int     @id @default(autoincrement())
+  pallet_id Int?
+  part_id   Int?
+  quantity  Int?
+  box_count Int?
+  pallet    pallet? @relation(fields: [pallet_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  parts     parts?  @relation(fields: [part_id], references: [id], onUpdate: NoAction)
+
+  @@index([pallet_id])
+}
+
+model parts {
+  id               Int                @id(map: "PK__parts__3213E83F8AF289FE") @default(autoincrement())
+  part_number      String             @unique(map: "UQ__parts__813D5BC89538965B") @db.NVarChar(50)
+  description      String?            @db.NVarChar(255)
+  ss_number        String?            @db.NVarChar(255)
+  qty_per_box      Int
+  weight_per_box   Decimal            @db.Decimal(10, 2)
+  box_type_id      Int?
+  min_on_hand_qty  Int?               @default(0, map: "DF__parts__min_on_ha__74AE54BC")
+  min_order_qty    Int?               @default(0, map: "DF__parts__min_order__75A278F5")
+  piece_price      Decimal?           @default(0, map: "DF__parts__piece_pri__76969D2E") @db.Decimal(10, 4)
+  created_at       DateTime?          @default(now(), map: "DF__parts__created_a__43D61337")
+  updated_at       DateTime?          @default(now(), map: "DF__parts__updated_a__44CA3770")
+  inventory        inventory?
+  order_releases   order_releases[]
+  order_replens    order_replens[]
+  pallet_breakdown pallet_breakdown[]
+  pallet_parts     pallet_parts[]
+  box_types        box_types?         @relation(fields: [box_type_id], references: [id], onUpdate: NoAction, map: "FK_parts_box_type")
+
+  @@index([box_type_id], map: "IX_parts_box_type_id")
+}
+
+model po_acknowledgement {
+  id                  Int            @id @default(autoincrement())
+  uuid                String         @unique @db.NVarChar(64)
+  po_number           String         @db.NVarChar(100)
+  vendor_name         String         @db.NVarChar(255)
+  vendor_contact      String?        @db.NVarChar(255)
+  status              String         @default("pending") @db.NVarChar(50)
+  responder_name      String?        @db.NVarChar(255)
+  expected_ready_date DateTime?
+  responded_at        DateTime?
+  created_at          DateTime       @default(now())
+  updated_at          DateTime
+  processed_indicator String         @default("n") @db.NVarChar(1)
+  po_line_item        po_line_item[]
+
+  @@index([status])
+  @@index([uuid])
+}
+
+model po_line_item {
+  id                  Int                @id @default(autoincrement())
+  po_ack_id           Int
+  part_number         String             @db.NVarChar(100)
+  component           String             @db.NVarChar(255)
+  quantity            Int
+  price               Decimal            @db.Decimal(12, 4)
+  due_date            DateTime           @db.Date
+  response_status     String?            @db.NVarChar(50)
+  proposed_quantity   Int?
+  proposed_price      Decimal?           @db.Decimal(12, 4)
+  proposed_due_date   DateTime?          @db.Date
+  denial_notes        String?            @db.NVarChar(500)
+  processed_indicator String             @default("n") @db.NVarChar(1)
+  po_acknowledgement  po_acknowledgement @relation(fields: [po_ack_id], references: [id], onDelete: Cascade)
+
+  @@index([po_ack_id])
+}
+
+model release_draft {
+  id            Int      @id @default(autoincrement())
+  release_data  String   @db.NVarChar(Max)
+  created_at    DateTime @default(now())
+  updated_at    DateTime
+  saved_by_name String?  @db.NVarChar(100)
+}
+
+model ship_addresses {
+  id            Int       @id(map: "PK__ship_add__3213E83FBF4F980C") @default(autoincrement())
+  name          String    @db.NVarChar(100)
+  address_line1 String?   @db.NVarChar(255)
+  address_line2 String?   @db.NVarChar(255)
+  city          String?   @db.NVarChar(100)
+  state         String?   @db.NVarChar(50)
+  zip           String?   @db.NVarChar(20)
+  is_active     Boolean?  @default(true, map: "DF__ship_addr__is_ac__02084FDA")
+  created_at    DateTime? @default(now(), map: "DF__ship_addr__creat__4F47C5E3")
+  orders        orders[]
+}

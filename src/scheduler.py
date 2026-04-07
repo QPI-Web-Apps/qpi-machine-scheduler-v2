@@ -174,18 +174,77 @@ def _assemble_schedule(
         m_batches.sort(key=lambda sb: sb.start_minute)
         spec = MACHINE_BY_ID[machine_id]
         spd = cfg.get_day_shift_map(machine_id)
-        prev_tool: Optional[str] = cfg.initial_tools.get(machine_id)
+        init_tool: Optional[str] = cfg.initial_tools.get(machine_id)
+
+        # In-progress jobs override the user-supplied initial_tool: the IP
+        # job is the real "previous state" of the machine, so the solver
+        # skips the init_tool constraint (solver.py:309-313) and we have to
+        # match that here, otherwise we'd render a phantom upfront CO.
+        machine_has_ip = any(sb.batch.has_in_progress for sb in m_batches)
+        if machine_has_ip:
+            init_tool = None
+
+        prev_tool: Optional[str] = init_tool
         prev_end: Optional[datetime] = None
 
-        # If the first batch doesn't start at minute 0, emit a NOT_RUNNING
-        # gap so the frontend timeline shows why the machine was idle.
+        # If the first batch doesn't start at minute 0, we have a leading
+        # gap. Two ways to fill it:
+        #   • If the user set an init_tool that *doesn't* match the first
+        #     batch, render an upfront CHANGEOVER ending exactly at the
+        #     first JOB's start (and shrink any NOT_RUNNING accordingly).
+        #   • Otherwise, fill the whole gap with NOT_RUNNING.
         if m_batches and m_batches[0].start_minute > 0:
+            first_sb = m_batches[0]
             first_start = _staffed_minute_to_datetime(
-                m_batches[0].start_minute, schedule_start, spd
+                first_sb.start_minute, schedule_start, spd
             )
             aligned_start = align_to_working_time(schedule_start, spd)
             gap_hours = staffed_hours_between(aligned_start, first_start, spd)
-            if gap_hours > MIN_GAP_HOURS:
+
+            needs_upfront_co = (
+                init_tool is not None
+                and spec.has_changeovers
+                and init_tool != first_sb.batch.tool_id
+            )
+            machine_co_hours = spec.changeover_hours if needs_upfront_co else 0.0
+
+            if needs_upfront_co and gap_hours + 1e-3 >= machine_co_hours:
+                # Reserve the trailing `changeover_hours` of the gap for the CO.
+                machine_co_min = round(machine_co_hours * 60)
+                co_start_minute = max(0, first_sb.start_minute - machine_co_min)
+                co_start_dt = _staffed_minute_to_datetime(
+                    co_start_minute, schedule_start, spd
+                )
+
+                # NOT_RUNNING fills the leading portion (if any) before the CO.
+                pre_co_gap_hours = staffed_hours_between(
+                    aligned_start, co_start_dt, spd
+                )
+                if pre_co_gap_hours > MIN_GAP_HOURS:
+                    entries.append(ScheduleEntry(
+                        machine_id=machine_id,
+                        entry_type="NOT_RUNNING",
+                        start=aligned_start,
+                        end=co_start_dt,
+                        idle_type="NO_CREW",
+                        shift=which_shift(aligned_start, spd),
+                    ))
+
+                # Upfront CO entry, ending exactly at the first JOB's start.
+                entry_type = "TOOL_SWAP" if spec.self_service_changeover else "CHANGEOVER"
+                entries.append(ScheduleEntry(
+                    machine_id=machine_id,
+                    entry_type=entry_type,
+                    start=co_start_dt,
+                    end=first_start,
+                    tool_id=f"{init_tool} -> {first_sb.batch.tool_id}",
+                    shift=which_shift(co_start_dt, spd),
+                ))
+
+                # The first batch is now "preceded" by the upfront CO, so the
+                # in-loop CO check below shouldn't fire for it.
+                prev_tool = first_sb.batch.tool_id
+            elif gap_hours > MIN_GAP_HOURS:
                 entries.append(ScheduleEntry(
                     machine_id=machine_id,
                     entry_type="NOT_RUNNING",

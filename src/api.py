@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import Body, FastAPI, File, Form, UploadFile
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -19,7 +21,7 @@ import copy
 
 from .export import generate_schedule_excel
 from .models import MACHINE_BY_ID
-from .scheduler import ScheduleResult, compute_machine_summary, generate_schedule, generate_schedule_from_jobs
+from .scheduler import ScheduleEntry, ScheduleResult, compute_machine_summary, generate_schedule, generate_schedule_from_jobs
 from .scheduler_io import SchedulerConfig, load_jobs_from_excel
 
 app = FastAPI(title="QPI Machine Scheduler V2")
@@ -35,6 +37,10 @@ app.add_middleware(
 # Bounded to prevent memory growth on long-running deployments.
 _MAX_RESULTS = 20
 _results: dict[str, dict] = {}
+
+# Used by both create_schedule (full yp list) and publish_schedule (filtering
+# scheduled JOB entries to yellow/pink ones).
+_YELLOW_PINK_RE = re.compile(r"yellow|pink", re.IGNORECASE)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
@@ -358,6 +364,23 @@ async def create_schedule(
             # Single-group: existing path
             result = generate_schedule(tmp_path, cfg, max_concurrent=max_concurrent)
             groups_meta = None
+
+        # Always load the FULL yellow/pink list regardless of the user's
+        # filter choice. The publish flow writes every yellow/pink job to
+        # scheduler_yellow_pink_jobs (Sullivan ETL feed) — even ones the user
+        # excluded from the running schedule. Loaded with no machine
+        # restrictions so the list reflects all yellow/pink work in the input.
+        yp_cfg = copy.deepcopy(cfg)
+        yp_cfg.include_yellow = True
+        yp_cfg.include_pink = True
+        yp_cfg.disabled_machines = []
+        yp_cfg.disabled_stations = []
+        all_yp_raw, _ = load_jobs_from_excel(tmp_path, yp_cfg)
+        all_yp_jobs = [
+            j for j in all_yp_raw
+            if j.get("ticket_color")
+            and _YELLOW_PINK_RE.search(j["ticket_color"])
+        ]
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
@@ -375,6 +398,7 @@ async def create_schedule(
         "result": result,
         "cfg": cfg,
         "data": response_data,
+        "all_yp_jobs": all_yp_jobs,
     }
 
     return JSONResponse(response_data)
@@ -407,6 +431,385 @@ def export_schedule(schedule_id: str):
         filename=f"schedule_{schedule_id}.xlsx",
         background=BackgroundTask(os.unlink, tmp.name),
     )
+
+
+# ── Publish to Portal_QPI ──────────────────────────────────────────
+#
+# Single "Publish Schedule" button (Matt, 2026-04-03 meeting) writes both:
+#   • scheduler_yellow_pink_jobs   — yellow/pink jobs for the Sullivan ETL
+#   • scheduler_published_schedule — full schedule for plan-vs-actual analysis
+#
+# Both tables use a processed_indicator (Y/N) column copied from the existing
+# po_acknowledgement convention. On each publish: every existing row is flipped
+# to 'n', then the new rows are inserted with 'y'. Wrapped in one Prisma
+# transaction so the indicator state can never end up half-y / half-n.
+
+_prisma = None  # lazy singleton — connects on first publish
+
+
+def _get_prisma():
+    """Return a connected Prisma client. Raises if connection fails."""
+    global _prisma
+    if _prisma is None:
+        from prisma import Prisma  # local import: keeps server bootable without prisma
+        _prisma = Prisma()
+    if not _prisma.is_connected():
+        _prisma.connect()
+    return _prisma
+
+
+def _derive_job_type(job_data: dict) -> str:
+    """Match the existing CSV export's Type column (frontend/index.html:1259)."""
+    tags = []
+    if job_data.get("is_labeler"):
+        tags.append("Labeler")
+    if job_data.get("is_bagger"):
+        tags.append("Bagger")
+    if job_data.get("is_in_progress"):
+        tags.append("In Progress")
+    if job_data.get("is_picked"):
+        tags.append("Picked")
+    return ", ".join(tags) if tags else "Regular"
+
+
+def _yellow_pink_row(entry: ScheduleEntry, published_at: datetime) -> dict:
+    """Build one scheduler_yellow_pink_jobs row from a scheduled JOB entry.
+
+    Column mapping mirrors the CSV Venky currently sends to Sullivan
+    (frontend/index.html:1267). Note that "Part #" in that CSV is the
+    finished_item field, so we store finished_item in part_number.
+    """
+    j = entry.job_data or {}
+    return {
+        "published_at": published_at,
+        "so_number": entry.so_number or "",
+        "part_number": j.get("finished_item") or None,
+        "description": j.get("description") or None,
+        "tool_id": entry.tool_id,
+        "machine": entry.machine_id,
+        "due_date": j.get("due_date"),
+        "scheduled_start": entry.start,
+        "ticket_color": j.get("ticket_color") or "",
+        "job_type": _derive_job_type(j),
+        "processed_indicator": "y",
+    }
+
+
+def _yellow_pink_row_unscheduled(j: dict, published_at: datetime) -> dict:
+    """Build one row for a yellow/pink job that was NOT in the running schedule.
+
+    Used for jobs that the user excluded via the include_yellow / include_pink
+    filters but that still need to land in scheduler_yellow_pink_jobs for the
+    Sullivan ETL feed (per the 2026-04-03 meeting).
+
+    machine and scheduled_start are NULL because there is no schedule slot.
+    preferred_machine is used as a fallback hint when the EQP code pinned
+    the job to a specific machine.
+    """
+    return {
+        "published_at": published_at,
+        "so_number": j.get("so_number") or "",
+        "part_number": j.get("finished_item") or None,
+        "description": j.get("description") or None,
+        "tool_id": j.get("tool_id"),
+        "machine": j.get("preferred_machine"),
+        "due_date": j.get("due_date"),
+        "scheduled_start": None,
+        "ticket_color": j.get("ticket_color") or "",
+        "job_type": _derive_job_type(j),
+        "processed_indicator": "y",
+    }
+
+
+def _schedule_row(entry: ScheduleEntry, published_at: datetime) -> dict:
+    """Build one scheduler_published_schedule row from any ScheduleEntry."""
+    row = {
+        "published_at": published_at,
+        "machine_id": entry.machine_id,
+        "entry_type": entry.entry_type,
+        "start_time": entry.start,
+        "end_time": entry.end,
+        "shift": entry.shift,
+        "machine_group": entry.group,
+        "tool_id": entry.tool_id,
+        "crew_from": entry.crew_from,
+        "crew_to": entry.crew_to,
+        "idle_type": entry.idle_type,
+        "headcount": entry.headcount,
+        "processed_indicator": "y",
+    }
+    if entry.entry_type == "JOB" and entry.job_data:
+        j = entry.job_data
+        row.update({
+            "so_number": entry.so_number,
+            "finished_item": j.get("finished_item"),
+            "description": j.get("description"),
+            "customer": j.get("customer"),
+            "remaining_qty": j.get("remaining_qty"),
+            "run_hours": j.get("run_hours"),
+            "due_date": j.get("due_date"),
+            "priority_class": j.get("priority_class"),
+            "ticket_color": j.get("ticket_color"),
+            "is_labeler": bool(j.get("is_labeler")),
+            "is_bagger": bool(j.get("is_bagger")),
+            "is_in_progress": bool(j.get("is_in_progress")),
+            "is_picked": bool(j.get("is_picked")),
+        })
+    return row
+
+
+@app.post("/api/schedule/{schedule_id}/publish")
+def publish_schedule(schedule_id: str):
+    """Publish the schedule to Portal_QPI.
+
+    Behavior, in one transaction:
+      1. UPDATE scheduler_yellow_pink_jobs   SET processed_indicator='n'
+      2. UPDATE scheduler_published_schedule SET processed_indicator='n'
+      3. INSERT new yellow/pink rows  with processed_indicator='y'
+      4. INSERT new schedule rows     with processed_indicator='y'
+    Returns row counts and the published_at timestamp.
+    """
+    stored = _results.get(schedule_id)
+    if not stored:
+        return JSONResponse({"error": "Schedule not found"}, status_code=404)
+
+    result: ScheduleResult = stored["result"]
+    all_yp_jobs: list[dict] = stored.get("all_yp_jobs", [])
+    published_at = datetime.utcnow()
+
+    # Build payloads up front so a failure here doesn't half-publish.
+    #
+    # Per the 2026-04-03 meeting, the yellow/pink table feeds the Sullivan ETL
+    # report and must contain EVERY yellow/pink job from the input — including
+    # ones the user excluded from the running schedule via the include_yellow /
+    # include_pink checkboxes. We therefore enumerate `all_yp_jobs` (loaded
+    # unconditionally in create_schedule) and override with scheduled-entry
+    # data when a job is also in the schedule.
+    scheduled_yp_by_so: dict[str, ScheduleEntry] = {}
+    for e in result.entries:
+        if (
+            e.entry_type == "JOB"
+            and e.job_data
+            and e.job_data.get("ticket_color")
+            and _YELLOW_PINK_RE.search(e.job_data["ticket_color"])
+            and e.so_number
+        ):
+            # If the same SO appears in multiple JOB rows (split batches),
+            # keep the earliest one — that's the one Sullivan cares about.
+            existing = scheduled_yp_by_so.get(e.so_number)
+            if existing is None or e.start < existing.start:
+                scheduled_yp_by_so[e.so_number] = e
+
+    yp_rows: list[dict] = []
+    seen_yp_so: set[str] = set()
+    for j in all_yp_jobs:
+        so = j.get("so_number") or ""
+        if not so or so in seen_yp_so:
+            continue
+        seen_yp_so.add(so)
+        scheduled = scheduled_yp_by_so.get(so)
+        if scheduled is not None:
+            yp_rows.append(_yellow_pink_row(scheduled, published_at))
+        else:
+            yp_rows.append(_yellow_pink_row_unscheduled(j, published_at))
+
+    schedule_rows = [_schedule_row(e, published_at) for e in result.entries]
+
+    try:
+        db = _get_prisma()
+    except Exception as exc:
+        return JSONResponse(
+            {"error": "Database connection failed", "detail": str(exc)},
+            status_code=503,
+        )
+
+    try:
+        # We use db.batch_() rather than db.tx() because the sync interface of
+        # prisma-client-py 0.15.0 has a bug with create_many inside db.tx() —
+        # it raises a generic 422 ("malformed GraphQL request") regardless of
+        # batch size. db.batch_() ships all ops to the engine as a single
+        # transaction and works correctly. The where={"not":"n"} filter on the
+        # updates is also a workaround: empty where={} hits the same 422 path.
+        batch = db.batch_()
+        batch.scheduler_yellow_pink_jobs.update_many(
+            where={"processed_indicator": {"not": "n"}},
+            data={"processed_indicator": "n"},
+        )
+        batch.scheduler_published_schedule.update_many(
+            where={"processed_indicator": {"not": "n"}},
+            data={"processed_indicator": "n"},
+        )
+        if yp_rows:
+            batch.scheduler_yellow_pink_jobs.create_many(data=yp_rows)
+        if schedule_rows:
+            batch.scheduler_published_schedule.create_many(data=schedule_rows)
+        batch.commit()
+    except Exception as exc:
+        return JSONResponse(
+            {"error": "Publish failed", "detail": str(exc)},
+            status_code=500,
+        )
+
+    return JSONResponse({
+        "ok": True,
+        "schedule_id": schedule_id,
+        "published_at": published_at.isoformat(),
+        "yellow_pink_count": len(yp_rows),
+        "schedule_count": len(schedule_rows),
+    })
+
+
+# ── Database viewer ────────────────────────────────────────────────
+#
+# Read + delete UI over the scheduler_* tables. Hard allowlist on the table
+# name so the 14 tables owned by the other two projects sharing Portal_QPI
+# can never be touched through these endpoints.
+
+# table name → (model accessor, ordered column list, default sort field)
+_VIEWABLE_TABLES: dict[str, dict] = {
+    "scheduler_yellow_pink_jobs": {
+        "accessor": lambda db: db.scheduler_yellow_pink_jobs,
+        "columns": [
+            "id", "published_at", "processed_indicator", "so_number",
+            "part_number", "description", "tool_id", "machine",
+            "due_date", "scheduled_start", "ticket_color", "job_type",
+        ],
+        "order_by": {"id": "desc"},
+    },
+    "scheduler_published_schedule": {
+        "accessor": lambda db: db.scheduler_published_schedule,
+        "columns": [
+            "id", "published_at", "processed_indicator", "machine_id",
+            "entry_type", "start_time", "end_time", "shift", "machine_group",
+            "tool_id", "so_number", "finished_item", "description", "customer",
+            "remaining_qty", "run_hours", "headcount", "due_date",
+            "priority_class", "ticket_color", "is_labeler", "is_bagger",
+            "is_in_progress", "is_picked", "crew_from", "crew_to", "idle_type",
+        ],
+        "order_by": {"id": "desc"},
+    },
+}
+
+_ROW_LIMIT = 5000  # cap to prevent dumping huge tables in one shot
+
+
+def _table_or_404(name: str):
+    """Return the spec for an allowed table, or None if not allowed."""
+    return _VIEWABLE_TABLES.get(name)
+
+
+@app.get("/api/db/tables")
+def db_list_tables():
+    """List the viewable scheduler tables with row counts."""
+    try:
+        db = _get_prisma()
+    except Exception as exc:
+        return JSONResponse({"error": "Database connection failed", "detail": str(exc)}, status_code=503)
+
+    out = []
+    for name, spec in _VIEWABLE_TABLES.items():
+        accessor = spec["accessor"](db)
+        total = accessor.count()
+        rows_y = accessor.count(where={"processed_indicator": "y"})
+        rows_n = accessor.count(where={"processed_indicator": "n"})
+        out.append({
+            "name": name,
+            "total": total,
+            "rows_y": rows_y,
+            "rows_n": rows_n,
+            "columns": spec["columns"],
+        })
+    return JSONResponse({"tables": out})
+
+
+@app.get("/api/db/tables/{name}/rows")
+def db_get_rows(name: str, filter: str = "all", limit: int = _ROW_LIMIT):
+    """Fetch rows for a viewable table.
+
+    filter: 'y' | 'n' | 'all'  (processed_indicator filter)
+    limit:  capped at _ROW_LIMIT to keep payloads bounded
+    """
+    spec = _table_or_404(name)
+    if not spec:
+        return JSONResponse({"error": f"Table {name!r} is not viewable"}, status_code=404)
+
+    try:
+        db = _get_prisma()
+    except Exception as exc:
+        return JSONResponse({"error": "Database connection failed", "detail": str(exc)}, status_code=503)
+
+    accessor = spec["accessor"](db)
+
+    where: dict = {}
+    if filter == "y":
+        where = {"processed_indicator": "y"}
+    elif filter == "n":
+        where = {"processed_indicator": "n"}
+    # 'all' → no filter; we use a dummy non-empty filter to dodge the
+    # prisma-client-py empty-where bug only on the count side. find_many is OK.
+
+    if where:
+        total = accessor.count(where=where)
+    else:
+        total = accessor.count()
+
+    take = max(1, min(int(limit), _ROW_LIMIT))
+    find_kwargs = {"take": take, "order": spec["order_by"]}
+    if where:
+        find_kwargs["where"] = where
+    rows = accessor.find_many(**find_kwargs)
+
+    # Serialize via Pydantic .model_dump() then jsonable_encoder for safety
+    serialized = [jsonable_encoder(r.model_dump()) for r in rows]
+
+    return JSONResponse({
+        "name": name,
+        "columns": spec["columns"],
+        "total": total,
+        "returned": len(serialized),
+        "limit": take,
+        "rows": serialized,
+    })
+
+
+@app.post("/api/db/tables/{name}/delete")
+def db_delete_rows(name: str, body: dict = Body(...)):
+    """Delete rows from a viewable scheduler_* table.
+
+    Body: {"ids": [1,2,3]} for row deletes, or {"all": true} for full wipe.
+    Returns the number of rows deleted.
+    """
+    spec = _table_or_404(name)
+    if not spec:
+        return JSONResponse({"error": f"Table {name!r} is not deletable"}, status_code=404)
+
+    try:
+        db = _get_prisma()
+    except Exception as exc:
+        return JSONResponse({"error": "Database connection failed", "detail": str(exc)}, status_code=503)
+
+    accessor = spec["accessor"](db)
+
+    if body.get("all") is True:
+        # Same prisma-client-py empty-where workaround used in publish: filter
+        # to "id is not the impossible value" instead of where={}.
+        try:
+            count = accessor.delete_many(where={"id": {"gt": 0}})
+        except Exception as exc:
+            return JSONResponse({"error": "Delete failed", "detail": str(exc)}, status_code=500)
+        return JSONResponse({"deleted": count})
+
+    ids = body.get("ids") or []
+    if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids):
+        return JSONResponse({"error": "ids must be a list of integers"}, status_code=400)
+    if not ids:
+        return JSONResponse({"deleted": 0})
+
+    try:
+        count = accessor.delete_many(where={"id": {"in": ids}})
+    except Exception as exc:
+        return JSONResponse({"error": "Delete failed", "detail": str(exc)}, status_code=500)
+    return JSONResponse({"deleted": count})
 
 
 # Serve frontend

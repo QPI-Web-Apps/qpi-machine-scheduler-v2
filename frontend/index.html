@@ -22,6 +22,8 @@
       <button class="run-btn" id="runBtn" disabled onclick="runSchedule()">Generate</button>
       <button class="run-btn" id="exportBtn" style="display:none;" onclick="exportExcel()">Export Excel</button>
       <button class="run-btn" id="saveJsonBtn" style="display:none;" onclick="saveScheduleJson()">Save JSON</button>
+      <button class="run-btn" id="publishBtn" style="display:none;" onclick="publishSchedule()">Publish Schedule</button>
+      <button class="upload-btn" onclick="toggleDbPanel()">Database</button>
       <button class="upload-btn" onclick="document.getElementById('jsonFileInput').click()">Load JSON</button>
       <input type="file" id="jsonFileInput" accept=".json" style="display:none;">
     </div>
@@ -61,6 +63,33 @@
   </div>
   <div id="multiGroupMode" style="display:none;">
     <div id="groupGrid"></div>
+  </div>
+</div>
+
+<div class="db-modal-backdrop collapsed" id="dbPanel" onclick="if(event.target===this)toggleDbPanel()">
+  <div class="db-modal" role="dialog" aria-modal="true" aria-labelledby="dbModalTitle">
+    <div class="db-panel-header">
+      <h3 id="dbModalTitle">Portal_QPI · Scheduler Tables</h3>
+      <div class="db-panel-actions">
+        <button class="day-btn" onclick="loadDbTables()">Refresh</button>
+        <button class="day-btn" onclick="toggleDbPanel()">Close</button>
+      </div>
+    </div>
+    <div class="db-tabs" id="dbTabs"></div>
+    <div class="db-toolbar" id="dbToolbar" style="display:none;">
+      <label>Show:
+        <select id="dbFilter" onchange="loadDbRows()">
+          <option value="y">Current snapshot (Y)</option>
+          <option value="n">Historical (N)</option>
+          <option value="all">All rows</option>
+        </select>
+      </label>
+      <span class="db-count" id="dbCount">—</span>
+      <span class="db-spacer"></span>
+      <button class="run-btn db-danger" id="dbDeleteSelected" onclick="deleteSelectedDbRows()" disabled>Delete Selected</button>
+      <button class="run-btn db-danger" id="dbDeleteAll" onclick="deleteAllDbRows()">Delete All</button>
+    </div>
+    <div class="db-table-wrap" id="dbTableWrap"></div>
   </div>
 </div>
 
@@ -494,6 +523,7 @@ async function runSchedule() {
   document.getElementById('tabsBar').style.display = 'none';
   document.getElementById('exportBtn').style.display = 'none';
   document.getElementById('saveJsonBtn').style.display = 'none';
+  document.getElementById('publishBtn').style.display = 'none';
   document.querySelectorAll('.tab-panel').forEach(p => p.style.display = 'none');
 
   const formData = new FormData();
@@ -563,6 +593,191 @@ function saveScheduleJson() {
   a.download = `schedule_${dateStr}_${id}.json`;
   a.click();
   URL.revokeObjectURL(a.href);
+}
+
+// ── Publish Schedule (writes to Portal_QPI) ───────────
+async function publishSchedule() {
+  if (!scheduleData || !scheduleData.schedule_id) return;
+  const btn = document.getElementById('publishBtn');
+  if (!confirm('Publish this schedule to the database? This will overwrite the previous published snapshot.')) return;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Publishing…';
+  try {
+    const resp = await fetch('/api/schedule/' + scheduleData.schedule_id + '/publish', { method: 'POST' });
+    const body = await resp.json();
+    if (!resp.ok || !body.ok) {
+      throw new Error(body.error + (body.detail ? ': ' + body.detail : ''));
+    }
+    alert(`Published. ${body.yellow_pink_count} yellow/pink job(s) and ${body.schedule_count} schedule entries written.`);
+  } catch (err) {
+    alert('Publish failed: ' + err.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+}
+
+// ── Database viewer ───────────────────────────────────
+let dbState = {
+  tables: [],            // [{name, total, rows_y, rows_n, columns}]
+  activeTable: null,     // table name
+  rows: [],              // current rows for activeTable
+  columns: [],           // current columns
+  selected: new Set(),   // selected row ids
+};
+
+function toggleDbPanel() {
+  const panel = document.getElementById('dbPanel');
+  const wasCollapsed = panel.classList.contains('collapsed');
+  panel.classList.toggle('collapsed');
+  if (wasCollapsed) loadDbTables();
+}
+
+async function loadDbTables() {
+  const tabsEl = document.getElementById('dbTabs');
+  tabsEl.innerHTML = '<div class="db-loading">Loading tables…</div>';
+  try {
+    const resp = await fetch('/api/db/tables');
+    const body = await resp.json();
+    if (!resp.ok) throw new Error(body.error || 'failed to list tables');
+    dbState.tables = body.tables;
+    renderDbTabs();
+    if (!dbState.activeTable && dbState.tables.length) {
+      selectDbTable(dbState.tables[0].name);
+    } else if (dbState.activeTable) {
+      await loadDbRows();
+    }
+  } catch (err) {
+    tabsEl.innerHTML = '<div class="db-error">Error: ' + err.message + '</div>';
+  }
+}
+
+function renderDbTabs() {
+  const tabsEl = document.getElementById('dbTabs');
+  tabsEl.innerHTML = dbState.tables.map(t => {
+    const active = t.name === dbState.activeTable ? ' active' : '';
+    return `<button class="db-tab${active}" onclick="selectDbTable('${t.name}')">
+      <span class="db-tab-name">${t.name}</span>
+      <span class="db-tab-count">${t.total}</span>
+    </button>`;
+  }).join('');
+}
+
+function selectDbTable(name) {
+  dbState.activeTable = name;
+  dbState.selected.clear();
+  renderDbTabs();
+  document.getElementById('dbToolbar').style.display = 'flex';
+  loadDbRows();
+}
+
+async function loadDbRows() {
+  if (!dbState.activeTable) return;
+  const wrap = document.getElementById('dbTableWrap');
+  wrap.innerHTML = '<div class="db-loading">Loading rows…</div>';
+  const filter = document.getElementById('dbFilter').value;
+  try {
+    const resp = await fetch(`/api/db/tables/${dbState.activeTable}/rows?filter=${filter}&limit=5000`);
+    const body = await resp.json();
+    if (!resp.ok) throw new Error(body.error || 'failed to load rows');
+    dbState.rows = body.rows;
+    dbState.columns = body.columns;
+    dbState.selected.clear();
+    renderDbRows(body.total, body.returned);
+    updateDeleteButtons();
+  } catch (err) {
+    wrap.innerHTML = '<div class="db-error">Error: ' + err.message + '</div>';
+  }
+}
+
+function renderDbRows(total, returned) {
+  document.getElementById('dbCount').textContent =
+    returned === total ? `${total} rows` : `showing ${returned} of ${total} rows`;
+
+  if (!dbState.rows.length) {
+    document.getElementById('dbTableWrap').innerHTML = '<div class="db-empty">No rows.</div>';
+    return;
+  }
+
+  const cols = dbState.columns;
+  const fmt = v => {
+    if (v === null || v === undefined) return '';
+    if (typeof v === 'boolean') return v ? '✓' : '';
+    if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(v)) {
+      try { return new Date(v).toLocaleString(); } catch (_) { return v; }
+    }
+    return String(v);
+  };
+
+  const head = '<tr><th class="db-check"><input type="checkbox" id="dbCheckAll" onchange="toggleAllDbRows(this.checked)"></th>'
+    + cols.map(c => `<th>${c}</th>`).join('') + '</tr>';
+
+  const body = dbState.rows.map(r => {
+    const checked = dbState.selected.has(r.id) ? ' checked' : '';
+    const cells = cols.map(c => `<td>${escapeHtml(fmt(r[c]))}</td>`).join('');
+    return `<tr><td class="db-check"><input type="checkbox" data-id="${r.id}" ${checked} onchange="toggleDbRow(${r.id}, this.checked)"></td>${cells}</tr>`;
+  }).join('');
+
+  document.getElementById('dbTableWrap').innerHTML =
+    `<div class="db-scroll"><table class="data-table db-table"><thead>${head}</thead><tbody>${body}</tbody></table></div>`;
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function toggleDbRow(id, checked) {
+  if (checked) dbState.selected.add(id); else dbState.selected.delete(id);
+  updateDeleteButtons();
+}
+
+function toggleAllDbRows(checked) {
+  dbState.selected.clear();
+  if (checked) dbState.rows.forEach(r => dbState.selected.add(r.id));
+  document.querySelectorAll('#dbTableWrap input[type="checkbox"][data-id]').forEach(cb => {
+    cb.checked = checked;
+  });
+  updateDeleteButtons();
+}
+
+function updateDeleteButtons() {
+  const btn = document.getElementById('dbDeleteSelected');
+  const n = dbState.selected.size;
+  btn.disabled = n === 0;
+  btn.textContent = n ? `Delete Selected (${n})` : 'Delete Selected';
+}
+
+async function deleteSelectedDbRows() {
+  if (!dbState.activeTable || dbState.selected.size === 0) return;
+  const ids = Array.from(dbState.selected);
+  if (!confirm(`Delete ${ids.length} row(s) from ${dbState.activeTable}? This cannot be undone.`)) return;
+  await postDbDelete({ ids });
+}
+
+async function deleteAllDbRows() {
+  if (!dbState.activeTable) return;
+  const tableName = dbState.activeTable;
+  const t = dbState.tables.find(x => x.name === tableName);
+  const total = t ? t.total : '?';
+  if (!confirm(`Delete ALL ${total} row(s) from ${tableName}?\n\nThis cannot be undone.`)) return;
+  await postDbDelete({ all: true });
+}
+
+async function postDbDelete(payload) {
+  try {
+    const resp = await fetch(`/api/db/tables/${dbState.activeTable}/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const body = await resp.json();
+    if (!resp.ok) throw new Error(body.error + (body.detail ? ': ' + body.detail : ''));
+    alert(`Deleted ${body.deleted} row(s).`);
+    loadDbTables();
+  } catch (err) {
+    alert('Delete failed: ' + err.message);
+  }
 }
 
 document.getElementById('jsonFileInput').addEventListener('change', (e) => {
@@ -636,6 +851,7 @@ function onScheduleLoaded() {
   document.getElementById('tabsBar').style.display = 'flex';
   document.getElementById('exportBtn').style.display = scheduleData.schedule_id ? 'inline-block' : 'none';
   document.getElementById('saveJsonBtn').style.display = 'inline-block';
+  document.getElementById('publishBtn').style.display = scheduleData.schedule_id ? 'inline-block' : 'none';
   document.getElementById('panel-gantt').style.display = 'block';
 
   document.getElementById('statStatus').textContent = scheduleData.solver_status;
@@ -1285,6 +1501,10 @@ function exportYelPinkCSV() {
 
 // ── Keyboard nav ───────────────────────────────────────
 document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !document.getElementById('dbPanel').classList.contains('collapsed')) {
+    toggleDbPanel();
+    return;
+  }
   if (e.key === 'ArrowLeft') changeDay(-1);
   if (e.key === 'ArrowRight') changeDay(1);
 });
