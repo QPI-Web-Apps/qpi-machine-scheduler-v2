@@ -4,3 +4,5 @@ openpyxl==3.1.5
 ortools==9.15.6755
 pandas==3.0.1
 python-multipart==0.0.22
+prisma==0.15.0
+
