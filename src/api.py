@@ -455,6 +455,19 @@ _prisma = None  # lazy singleton — connects on first publish
 # gives generous headroom for batched create_many on the publish path.
 _PRISMA_HTTP_TIMEOUT = 60.0
 
+# Maximum rows per create_many call on the publish path. Smaller chunks
+# mean shorter individual SQL transactions = less lock contention on the
+# shared Portal_QPI database, at the cost of more round trips per publish.
+# 100 is a balance: a typical publish (~80 yp + ~250 schedule rows) takes
+# ~5 chunked round trips instead of one giant 30s transaction.
+_PUBLISH_CHUNK_SIZE = 100
+
+
+def _chunks(items: list, size: int):
+    """Yield successive chunks of `items` of length `size`."""
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
 
 def _get_prisma():
     """Return a connected Prisma client. Raises if connection fails."""
@@ -632,30 +645,56 @@ def publish_schedule(schedule_id: str):
             status_code=503,
         )
 
+    # ── Publish in three steps to keep individual transactions short ──
+    #
+    # The previous "everything in one batch_()" approach held a single
+    # transaction open for 10–30s on the shared Portal_QPI database, which
+    # is rough on lock contention with the two other projects writing to
+    # this DB. Splitting into a fast flip step + chunked inserts trades
+    # whole-publish atomicity for short lock duration.
+    #
+    # Retry semantics:
+    #   • Step 1 (flip) is idempotent — re-running just sets already-'n'
+    #     rows to 'n' again (the {"not": "n"} filter makes this a no-op).
+    #   • Steps 2/3 (chunked inserts) are NOT atomic across chunks — a
+    #     mid-step failure leaves a partial set of new 'y' rows. Retrying
+    #     the whole publish is safe though: the next publish's flip step
+    #     marks those partial 'y' rows as 'n' (becoming historical noise)
+    #     and inserts a fresh, complete set as 'y'. The current snapshot
+    #     after a successful publish is always correct.
+    #
+    # Note on prisma-client-py: db.batch_() is used (not db.tx()) because
+    # 0.15.0 has a sync-interface bug where create_many inside db.tx()
+    # raises a generic 422 regardless of batch size. The where={"not":"n"}
+    # filter on the updates dodges the same code path with empty where={}.
     try:
-        # We use db.batch_() rather than db.tx() because the sync interface of
-        # prisma-client-py 0.15.0 has a bug with create_many inside db.tx() —
-        # it raises a generic 422 ("malformed GraphQL request") regardless of
-        # batch size. db.batch_() ships all ops to the engine as a single
-        # transaction and works correctly. The where={"not":"n"} filter on the
-        # updates is also a workaround: empty where={} hits the same 422 path.
-        batch = db.batch_()
-        batch.scheduler_yellow_pink_jobs.update_many(
+        # Step 1 — flip both tables to 'n' in one short transaction.
+        # Index on processed_indicator makes this a fast indexed UPDATE.
+        flip = db.batch_()
+        flip.scheduler_yellow_pink_jobs.update_many(
             where={"processed_indicator": {"not": "n"}},
             data={"processed_indicator": "n"},
         )
-        batch.scheduler_published_schedule.update_many(
+        flip.scheduler_published_schedule.update_many(
             where={"processed_indicator": {"not": "n"}},
             data={"processed_indicator": "n"},
         )
-        if yp_rows:
-            batch.scheduler_yellow_pink_jobs.create_many(data=yp_rows)
-        if schedule_rows:
-            batch.scheduler_published_schedule.create_many(data=schedule_rows)
-        batch.commit()
+        flip.commit()
+
+        # Step 2 — insert yellow/pink rows in chunks.
+        for chunk in _chunks(yp_rows, _PUBLISH_CHUNK_SIZE):
+            db.scheduler_yellow_pink_jobs.create_many(data=chunk)
+
+        # Step 3 — insert schedule rows in chunks.
+        for chunk in _chunks(schedule_rows, _PUBLISH_CHUNK_SIZE):
+            db.scheduler_published_schedule.create_many(data=chunk)
     except Exception as exc:
         return JSONResponse(
-            {"error": "Publish failed", "detail": str(exc)},
+            {
+                "error": "Publish failed",
+                "detail": str(exc),
+                "exc_type": type(exc).__name__,
+            },
             status_code=500,
         )
 
