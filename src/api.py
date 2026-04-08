@@ -446,13 +446,22 @@ def export_schedule(schedule_id: str):
 
 _prisma = None  # lazy singleton — connects on first publish
 
+# httpx timeout for the Python <-> prisma engine HTTP channel (NOT the
+# Azure SQL connection itself). The prisma engine talks to Azure SQL via
+# Tiberius and then returns results to Python over local HTTP. From
+# Coolify's network position the underlying SQL queries can take longer
+# than httpx's default 5s, surfacing as `httpx.ReadTimeout` in the engine
+# HTTP layer (see prisma/_sync_http.py and prisma/engine/_http.py). 60s
+# gives generous headroom for batched create_many on the publish path.
+_PRISMA_HTTP_TIMEOUT = 60.0
+
 
 def _get_prisma():
     """Return a connected Prisma client. Raises if connection fails."""
     global _prisma
     if _prisma is None:
         from prisma import Prisma  # local import: keeps server bootable without prisma
-        _prisma = Prisma()
+        _prisma = Prisma(http={"timeout": _PRISMA_HTTP_TIMEOUT})
     if not _prisma.is_connected():
         _prisma.connect()
     return _prisma
