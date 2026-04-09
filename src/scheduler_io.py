@@ -38,6 +38,7 @@ class SchedulerConfig:
     include_yellow: bool = False
     include_pink: bool = False
     include_white: bool = False
+    include_germantown: bool = False
     disabled_stations: list[str] = field(default_factory=list)
     disabled_machines: list[str] = field(default_factory=list)
     default_headcount: float = DEFAULT_HEADCOUNT
@@ -94,6 +95,7 @@ _COL_MAP = {
     "label_indicator": "is_labeler",
     "bag_indicator": "is_bagger",
     "Part Number": "part_number",
+    "Everything at STF": "at_stf",
 }
 
 
@@ -125,10 +127,11 @@ def _safe_float(val) -> Optional[float]:
 
 # ── Loading ─────────────────────────────────────────────────────────
 
-def load_jobs_from_excel(path: str, cfg: SchedulerConfig) -> tuple[list[dict], list[dict]]:
+def load_jobs_from_excel(path: str, cfg: SchedulerConfig) -> tuple[list[dict], list[dict], list[dict]]:
     """Load and prepare jobs from an Excel file.
 
-    Returns (jobs, skipped) where each is a list of dicts.
+    Returns (jobs, skipped, germantown_jobs) where each is a list of dicts.
+    Germantown jobs are green-ticket jobs with "Everything at STF" = N.
     """
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     ws = wb[wb.sheetnames[0]]
@@ -146,6 +149,7 @@ def load_jobs_from_excel(path: str, cfg: SchedulerConfig) -> tuple[list[dict], l
 
     jobs: list[dict] = []
     skipped: list[dict] = []
+    germantown_jobs: list[dict] = []
 
     for row in rows[1:]:
         raw = {key: row[idx] if idx < len(row) else None for key, idx in col_idx.items()}
@@ -251,6 +255,9 @@ def load_jobs_from_excel(path: str, cfg: SchedulerConfig) -> tuple[list[dict], l
                 skipped.append({"reason": "all eligible machines disabled", "so_number": so_number})
                 continue
 
+        # STF check for germantown filtering
+        at_stf = _safe_str(raw.get("at_stf")).upper()
+
         job = {
             "so_number": so_number,
             "sol_id": raw.get("sol_id"),
@@ -278,10 +285,17 @@ def load_jobs_from_excel(path: str, cfg: SchedulerConfig) -> tuple[list[dict], l
             "locked_machine": locked_machine,
             "order_entry_date": raw.get("order_entry_date"),
             "eligible_machines": eligible,
+            "at_stf": at_stf,
         }
+
+        # Germantown filter: green jobs with STF=N excluded by default
+        if at_stf == "N" and "green" in color and not cfg.include_germantown:
+            germantown_jobs.append(job)
+            continue
+
         jobs.append(job)
 
-    return jobs, skipped
+    return jobs, skipped, germantown_jobs
 
 
 def _build_eligibility(

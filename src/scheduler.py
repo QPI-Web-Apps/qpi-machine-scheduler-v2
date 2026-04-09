@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -61,6 +61,7 @@ class ScheduleResult:
     skipped_jobs: list[dict]
     makespan_hours: float
     solver_status: str
+    germantown_jobs: list[dict] = field(default_factory=list)
 
 
 # Minimum gap (hours) to generate a NOT_RUNNING entry.  Gaps smaller
@@ -122,8 +123,10 @@ def generate_schedule(
     max_concurrent: int = 5,
 ) -> ScheduleResult:
     """Full pipeline: load Excel → optimize → assemble schedule."""
-    jobs, skipped = load_jobs_from_excel(excel_path, cfg)
-    return generate_schedule_from_jobs(jobs, skipped, cfg, max_concurrent)
+    jobs, skipped, germantown_jobs = load_jobs_from_excel(excel_path, cfg)
+    result = generate_schedule_from_jobs(jobs, skipped, cfg, max_concurrent)
+    result.germantown_jobs = germantown_jobs
+    return result
 
 
 def generate_schedule_from_jobs(

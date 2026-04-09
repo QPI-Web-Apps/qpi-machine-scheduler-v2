@@ -341,7 +341,7 @@ async def create_schedule(
     try:
         if parsed_groups:
             # Multi-group: load once, partition jobs, schedule each group
-            jobs, skipped = load_jobs_from_excel(tmp_path, cfg)
+            jobs, skipped, germantown_jobs = load_jobs_from_excel(tmp_path, cfg)
             group_jobs, extra_skipped = _assign_jobs_to_groups(jobs, parsed_groups)
             all_skipped = skipped + extra_skipped
 
@@ -360,6 +360,7 @@ async def create_schedule(
                 )
 
             result, groups_meta = _merge_results(group_results, parsed_groups)
+            result.germantown_jobs = germantown_jobs
         else:
             # Single-group: existing path
             result = generate_schedule(tmp_path, cfg, max_concurrent=max_concurrent)
@@ -375,7 +376,7 @@ async def create_schedule(
         yp_cfg.include_pink = True
         yp_cfg.disabled_machines = []
         yp_cfg.disabled_stations = []
-        all_yp_raw, _ = load_jobs_from_excel(tmp_path, yp_cfg)
+        all_yp_raw, _, _ = load_jobs_from_excel(tmp_path, yp_cfg)
         all_yp_jobs = [
             j for j in all_yp_raw
             if j.get("ticket_color")
@@ -389,6 +390,25 @@ async def create_schedule(
     response_data["schedule_id"] = schedule_id
     if groups_meta:
         response_data["groups"] = groups_meta
+
+    # Germantown report: green jobs with STF=N (not in schedule by default)
+    response_data["germantown_jobs"] = [
+        {
+            "so_number": j.get("so_number", ""),
+            "finished_item": j.get("finished_item", ""),
+            "description": j.get("description", ""),
+            "customer": j.get("customer", ""),
+            "tool_id": j.get("tool_id", ""),
+            "eqp_code": j.get("eqp_code", ""),
+            "remaining_qty": j.get("remaining_qty", 0),
+            "due_date": j["due_date"].isoformat() if j.get("due_date") else None,
+            "run_hours": round(j.get("run_hours", 0), 2),
+            "headcount": j.get("headcount", 0),
+            "priority_str": j.get("priority_str", ""),
+            "ticket_color": j.get("ticket_color", ""),
+        }
+        for j in result.germantown_jobs
+    ]
 
     # Store for download (evict oldest if at capacity)
     if len(_results) >= _MAX_RESULTS:

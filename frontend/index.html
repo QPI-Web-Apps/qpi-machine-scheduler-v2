@@ -126,6 +126,7 @@
   <div class="tab" data-tab="headcount">Headcount</div>
   <div class="tab" data-tab="jobs">All Jobs</div>
   <div class="tab" data-tab="yelpink">Yellow & Pink</div>
+  <div class="tab" data-tab="germantown">Germantown Report</div>
 </div>
 
 <div class="content">
@@ -201,6 +202,21 @@
       <thead><tr>
         <th>SO #</th><th>Part #</th><th>Description</th><th>Tool #</th>
         <th>Machine</th><th>Due Date</th><th>Scheduled Start</th><th>Ticket Color</th><th>Type</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <!-- Germantown Report Tab -->
+  <div class="tab-panel" id="panel-germantown" style="display:none;">
+    <div style="display:flex;align-items:center;gap:16px;margin-bottom:12px;">
+      <div id="germantownCount" style="font-weight:600;font-size:1.05rem;"></div>
+      <button class="run-btn" onclick="exportGermantownCSV()" style="padding:6px 16px;font-size:0.85rem;">Export Excel</button>
+    </div>
+    <table class="data-table" id="germantownTable">
+      <thead><tr>
+        <th>SO #</th><th>Part #</th><th>Description</th><th>Customer</th><th>Tool #</th>
+        <th>EQP Code</th><th>Remaining QTY</th><th>Due Date</th><th>Run Hrs</th><th>HC</th>
       </tr></thead>
       <tbody></tbody>
     </table>
@@ -883,6 +899,7 @@ function onScheduleLoaded() {
   renderHeadcount();
   renderJobsTable();
   renderYelPinkTable();
+  renderGermantownTable();
 }
 
 function computeDays() {
@@ -1495,6 +1512,56 @@ function exportYelPinkCSV() {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = 'yellow_pink_jobs.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ── Germantown Report ─────────────────────────────────
+function renderGermantownTable() {
+  const tbody = document.querySelector('#germantownTable tbody');
+  const jobs = scheduleData.germantown_jobs || [];
+  document.getElementById('germantownCount').textContent =
+    jobs.length ? jobs.length + ' Germantown job' + (jobs.length !== 1 ? 's' : '') + ' (not at STF)' : 'No Germantown jobs';
+
+  let html = '';
+  jobs.forEach(j => {
+    html += `<tr>
+      <td><strong>${j.so_number||'-'}</strong></td>
+      <td>${j.finished_item||'-'}</td>
+      <td>${j.description||'-'}</td>
+      <td>${j.customer||'-'}</td>
+      <td>${j.tool_id||'-'}</td>
+      <td>${j.eqp_code||'-'}</td>
+      <td>${j.remaining_qty||0}</td>
+      <td>${j.due_date?fmtDt(j.due_date):'-'}</td>
+      <td>${j.run_hours||0}</td>
+      <td>${j.headcount||0}</td>
+    </tr>`;
+  });
+  tbody.innerHTML = html;
+}
+
+function exportGermantownCSV() {
+  if (!scheduleData) return;
+  const jobs = scheduleData.germantown_jobs || [];
+  if (!jobs.length) return;
+
+  const esc = v => '"' + String(v||'').replace(/"/g,'""') + '"';
+  const rows = [['SO #','Part #','Description','Customer','Tool #','EQP Code','Remaining QTY','Due Date','Run Hrs','HC'].join(',')];
+  jobs.forEach(j => {
+    rows.push([
+      esc(j.so_number), esc(j.finished_item), esc(j.description),
+      esc(j.customer), esc(j.tool_id), esc(j.eqp_code),
+      j.remaining_qty||0,
+      esc(j.due_date ? new Date(j.due_date).toLocaleDateString() : ''),
+      j.run_hours||0, j.headcount||0
+    ].join(','));
+  });
+
+  const blob = new Blob([rows.join('\n')], {type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'germantown_report.csv';
   a.click();
   URL.revokeObjectURL(a.href);
 }
