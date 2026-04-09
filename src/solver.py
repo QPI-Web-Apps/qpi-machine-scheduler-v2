@@ -227,7 +227,7 @@ def solve_schedule(
     - Interval variable per batch (in staffed minutes)
     - No-overlap per machine, with changeover gaps between different tools
     - Max concurrent machines running (cumulative)
-    - Objective: minimize makespan
+    - Objective: minimize makespan + HC transitions + changeovers (P+ mode)
     """
     if not batches:
         return SolverResult([], 0, "OPTIMAL")
@@ -280,6 +280,7 @@ def solve_schedule(
         machine_batches.setdefault(b.machine_id, []).append(b)
 
     hc_penalty_terms: list[tuple] = []  # (literal, penalty_value)
+    co_penalty_terms: list[tuple] = []  # (literal, penalty_value) — changeover penalties
 
     for machine_id, m_batches in machine_batches.items():
         if not m_batches:
@@ -311,6 +312,7 @@ def solve_schedule(
                 model.add(
                     starts[bi.batch_id] >= machine_co
                 ).only_enforce_if(first_lit)
+                co_penalty_terms.append((first_lit, machine_co))
 
             # Arc: batch i+1 → depot (0) — batch i is last
             last_lit = model.new_bool_var(f"last_{machine_id}_{bi.batch_id}")
@@ -332,6 +334,10 @@ def solve_schedule(
                 model.add(
                     starts[bj.batch_id] >= ends[bi.batch_id] + gap
                 ).only_enforce_if(lit)
+
+                # Changeover penalty (collected for objective)
+                if gap > 0:
+                    co_penalty_terms.append((lit, gap))
 
                 # HC transition penalty (collected for objective)
                 if cfg.hc_penalty_weight > 0:
@@ -364,7 +370,7 @@ def solve_schedule(
     # Layer 1 (highest): late job count        (minimize_late only)
     # Layer 2:           total tardiness        (minimize_late only)
     # Layer 3:           priority start penalty (priority_boost / picked)
-    # Layer 4 (lowest):  makespan + HC transition penalty
+    # Layer 4 (lowest):  makespan + HC transition penalty + changeover penalty
 
     makespan = model.new_int_var(0, horizon, "makespan")
     for b in batches:
@@ -440,15 +446,20 @@ def solve_schedule(
     if hc_penalty_terms:
         hc_term = sum(lit * pen for lit, pen in hc_penalty_terms)
 
+    # ── Layer 4c: Changeover penalty (priority_boost mode) ──────
+    co_term = 0
+    if cfg.priority_boost and co_penalty_terms:
+        co_term = sum(lit * pen for lit, pen in co_penalty_terms)
+
     # ── Combine layers ─────────────────────────────────────────
-    # late_term >> prio_term >> makespan + hc_term
+    # late_term >> prio_term >> makespan + hc_term + co_term
     # Scale prio_term above makespan but below late_term
     has_prio = cfg.priority_boost or any(
         any(j.get("is_picked") for j in b.jobs) for b in batches
     )
     has_late = cfg.minimize_late and (late_vars or tardiness_vars)
 
-    objective = makespan + hc_term
+    objective = makespan + hc_term + co_term
     if has_prio:
         objective += prio_term * n_batches
     if has_late:

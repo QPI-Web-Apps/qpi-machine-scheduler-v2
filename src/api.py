@@ -259,7 +259,7 @@ async def create_schedule(
     include_white: bool = Form(default=False),
     shift_config: str = Form(default=""),
     initial_tools: str = Form(default=""),
-    priority_boost: bool = Form(default=False),
+    priority_boost: bool = Form(default=True),
     minimize_late: bool = Form(default=False),
     disabled_machines: str = Form(default=""),
     hc_penalty_weight: float = Form(default=30),
