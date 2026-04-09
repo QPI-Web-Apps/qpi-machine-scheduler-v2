@@ -528,18 +528,10 @@ def _collect_crew_events(
 
     freed_events: list[tuple[datetime, str, float, str, Optional[ScheduleEntry]]] = []
 
-    for co in entries:
-        if co.entry_type != "CHANGEOVER":
-            continue
-        prev_jobs = [
-            e for e in entries
-            if e.machine_id == co.machine_id
-            and e.entry_type == "JOB"
-            and e.end <= co.start + timedelta(minutes=5)
-        ]
-        hc = prev_jobs[-1].headcount if prev_jobs else 0
-        if hc:
-            freed_events.append((co.start, co.machine_id, hc, "changeover", co))
+    # Track which (machine, time) pairs have already been freed via
+    # end_of_work so that changeover events don't double-count crew
+    # that was already released.
+    freed_by_eow: set[tuple[str, datetime]] = set()
 
     for machine_id, m_entries in by_machine.items():
         for i, e in enumerate(m_entries):
@@ -550,12 +542,34 @@ def _collect_crew_events(
                 hc = e.headcount or 0
                 if hc:
                     freed_events.append((e.end, machine_id, hc, "end_of_work", e))
+                    freed_by_eow.add((machine_id, e.end))
             elif next_entry.entry_type == "TOOL_SWAP":
                 after_swap = m_entries[i + 2] if i + 2 < len(m_entries) else None
                 if after_swap is None or after_swap.entry_type != "JOB":
                     hc = e.headcount or 0
                     if hc:
                         freed_events.append((next_entry.end, machine_id, hc, "end_of_work", next_entry))
+                        freed_by_eow.add((machine_id, next_entry.end))
+
+    for co in entries:
+        if co.entry_type != "CHANGEOVER":
+            continue
+        # Find the job immediately before this changeover
+        prev_job = None
+        for e in by_machine.get(co.machine_id, []):
+            if (e.entry_type == "JOB"
+                    and e.end <= co.start + timedelta(minutes=5)):
+                prev_job = e
+        if prev_job is None:
+            continue
+        hc = prev_job.headcount or 0
+        if not hc:
+            continue
+        # Skip if this crew was already freed by end_of_work (the job
+        # ended into NOT_RUNNING before this changeover started).
+        if (co.machine_id, prev_job.end) in freed_by_eow:
+            continue
+        freed_events.append((co.start, co.machine_id, hc, "changeover", co))
 
     return freed_events, job_starts
 
