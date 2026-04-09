@@ -281,6 +281,9 @@ def solve_schedule(
 
     hc_penalty_terms: list[tuple] = []  # (literal, penalty_value)
     co_penalty_terms: list[tuple] = []  # (literal, penalty_value) — changeover penalties
+    # Track changeover arcs per machine for crew-sandwich detection
+    # co_arcs[machine_id][(i, j)] = lit  — arc literal for batch i→j with tool change
+    co_arcs: dict[str, dict[tuple[int, int], cp_model.IntVar]] = {}
 
     for machine_id, m_batches in machine_batches.items():
         if not m_batches:
@@ -338,6 +341,7 @@ def solve_schedule(
                 # Changeover penalty (collected for objective)
                 if gap > 0:
                     co_penalty_terms.append((lit, gap))
+                    co_arcs.setdefault(machine_id, {})[(i, j)] = lit
 
                 # HC transition penalty (collected for objective)
                 if cfg.hc_penalty_weight > 0:
@@ -347,6 +351,45 @@ def solve_schedule(
                         hc_penalty_terms.append((lit, penalty))
 
         model.add_circuit(arcs)
+
+    # ── Crew-sandwich penalty ─────────────────────────────────
+    #
+    # Penalize small batches sandwiched between two changeovers on the
+    # same machine.  This pattern forces crew to jump away (changeover
+    # before), jump back (short job), then jump away again (changeover
+    # after), creating idle crew time the post-hoc optimizer can't fix.
+    #
+    # For each triple (i→j→k) where both arcs have tool changes and
+    # batch j is short, add a penalty proportional to the changeover
+    # time so the solver prefers merging or reordering to avoid the
+    # sandwich.
+
+    CREW_SANDWICH_THRESHOLD = 90  # minutes: batches shorter than this trigger penalty
+    crew_sandwich_terms: list[tuple] = []
+
+    for machine_id, arcs_dict in co_arcs.items():
+        spec = MACHINE_BY_ID[machine_id]
+        machine_co = round(spec.changeover_hours * 60) if spec.has_changeovers else 0
+        m_batches_local = machine_batches[machine_id]
+
+        for (i, j), lit_ij in arcs_dict.items():
+            bj = m_batches_local[j]
+            if bj.total_minutes >= CREW_SANDWICH_THRESHOLD:
+                continue
+            # Look for any arc j→k that also has a changeover
+            for (j2, k), lit_jk in arcs_dict.items():
+                if j2 != j:
+                    continue
+                # Both i→j and j→k are changeover arcs, and j is short.
+                # Penalize when BOTH are active simultaneously.
+                sandwich_lit = model.new_bool_var(
+                    f"sandwich_{machine_id}_{i}_{j}_{k}"
+                )
+                model.add(lit_ij + lit_jk == 2).only_enforce_if(sandwich_lit)
+                model.add(lit_ij + lit_jk < 2).only_enforce_if(~sandwich_lit)
+                # Penalty = both changeovers worth of idle crew time
+                penalty = 2 * machine_co
+                crew_sandwich_terms.append((sandwich_lit, penalty))
 
     # ── Max concurrent machines (cumulative) ────────────────────
 
@@ -451,15 +494,28 @@ def solve_schedule(
     if cfg.priority_boost and co_penalty_terms:
         co_term = sum(lit * pen for lit, pen in co_penalty_terms)
 
+    # ── Layer 4d: Crew-sandwich penalty ──────────────────────────
+    sandwich_term = 0
+    if crew_sandwich_terms:
+        sandwich_term = sum(lit * pen for lit, pen in crew_sandwich_terms)
+
+    # ── Layer 4e: Compactness — push batches to start early ────
+    # Without this, non-critical-path batches float freely and may
+    # start long after their changeover finishes, leaving machines
+    # idle with tool loaded.  A tiny weight ensures the solver
+    # prefers earlier starts as a tiebreaker without overriding
+    # makespan, priority, or other objectives.
+    compact_term = sum(starts[b.batch_id] for b in batches)
+
     # ── Combine layers ─────────────────────────────────────────
-    # late_term >> prio_term >> makespan + hc_term + co_term
+    # late_term >> prio_term >> makespan + hc_term + co_term + compact
     # Scale prio_term above makespan but below late_term
     has_prio = cfg.priority_boost or any(
         any(j.get("is_picked") for j in b.jobs) for b in batches
     )
     has_late = cfg.minimize_late and (late_vars or tardiness_vars)
 
-    objective = makespan + hc_term + co_term
+    objective = makespan + hc_term + co_term + sandwich_term + compact_term
     if has_prio:
         objective += prio_term * n_batches
     if has_late:
