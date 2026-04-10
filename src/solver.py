@@ -220,7 +220,7 @@ def solve_schedule(
     batches: list[ToolBatch],
     cfg: SchedulerConfig,
     max_concurrent: int = 5,
-    time_limit_seconds: float = 120.0,
+    time_limit_seconds: float = 200.0,
 ) -> SolverResult:
     """Find optimal batch ordering and timing using CP-SAT.
 
