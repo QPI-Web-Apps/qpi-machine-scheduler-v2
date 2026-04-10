@@ -285,6 +285,12 @@ def solve_schedule(
     # co_arcs[machine_id][(i, j)] = lit  — arc literal for batch i→j with tool change
     co_arcs: dict[str, dict[tuple[int, int], cp_model.IntVar]] = {}
 
+    # Explicit changeover interval variables for cross-machine NoOverlap.
+    # Each changeover (initial or between batches) gets an optional interval
+    # tied to the arc literal that activates it.  A global NoOverlap on
+    # these prevents two maintenance changeovers from running simultaneously.
+    co_intervals: list[cp_model.IntervalVar] = []
+
     for machine_id, m_batches in machine_batches.items():
         if not m_batches:
             continue
@@ -312,9 +318,17 @@ def solve_schedule(
             # differs from the tool already loaded, it must wait for a changeover.
             if (init_tool and init_tool != bi.tool_id
                     and machine_co > 0 and not has_ip):
+                # Changeover occupies [0, machine_co) before the batch starts
+                co_end = model.new_int_var(0, horizon, f"ico_end_{machine_id}_{bi.batch_id}")
+                model.add(co_end == machine_co).only_enforce_if(first_lit)
                 model.add(
-                    starts[bi.batch_id] >= machine_co
+                    starts[bi.batch_id] >= co_end
                 ).only_enforce_if(first_lit)
+                co_iv = model.new_optional_interval_var(
+                    0, machine_co, co_end,
+                    first_lit, f"ico_iv_{machine_id}_{bi.batch_id}"
+                )
+                co_intervals.append(co_iv)
                 co_penalty_terms.append((first_lit, machine_co))
 
             # Arc: batch i+1 → depot (0) — batch i is last
@@ -334,14 +348,28 @@ def solve_schedule(
 
                 # Time gap: changeover if different tools
                 gap = machine_co if bi.tool_id != bj.tool_id else 0
-                model.add(
-                    starts[bj.batch_id] >= ends[bi.batch_id] + gap
-                ).only_enforce_if(lit)
 
-                # Changeover penalty (collected for objective)
                 if gap > 0:
+                    # Explicit changeover interval: starts when batch i ends,
+                    # batch j starts after changeover completes.
+                    co_start = model.new_int_var(0, horizon, f"co_s_{machine_id}_{bi.batch_id}_{bj.batch_id}")
+                    co_end_var = model.new_int_var(0, horizon, f"co_e_{machine_id}_{bi.batch_id}_{bj.batch_id}")
+                    model.add(co_start == ends[bi.batch_id]).only_enforce_if(lit)
+                    model.add(co_end_var == co_start + gap).only_enforce_if(lit)
+                    model.add(starts[bj.batch_id] >= co_end_var).only_enforce_if(lit)
+
+                    co_iv = model.new_optional_interval_var(
+                        co_start, gap, co_end_var,
+                        lit, f"co_iv_{machine_id}_{bi.batch_id}_{bj.batch_id}"
+                    )
+                    co_intervals.append(co_iv)
+
                     co_penalty_terms.append((lit, gap))
                     co_arcs.setdefault(machine_id, {})[(i, j)] = lit
+                else:
+                    model.add(
+                        starts[bj.batch_id] >= ends[bi.batch_id]
+                    ).only_enforce_if(lit)
 
                 # HC transition penalty (collected for objective)
                 if cfg.hc_penalty_weight > 0:
@@ -351,6 +379,11 @@ def solve_schedule(
                         hc_penalty_terms.append((lit, penalty))
 
         model.add_circuit(arcs)
+
+    # ── No simultaneous changeovers (global) ──────────────────
+    # Maintenance changeovers share one crew — at most one at a time.
+    if co_intervals:
+        model.add_no_overlap(co_intervals)
 
     # ── Crew-sandwich penalty ─────────────────────────────────
     #
