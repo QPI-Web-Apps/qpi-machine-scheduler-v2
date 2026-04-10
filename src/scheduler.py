@@ -696,7 +696,8 @@ def _score_assignment(
     ping_pongs = 0
 
     # Track flows for ping-pong detection
-    flows: list[tuple[str, str, datetime]] = []  # (from, to, time)
+    # forced=True when the freed event has only one feasible target
+    flows: list[tuple[str, str, datetime, bool]] = []  # (from, to, time, forced)
 
     for i, target_idx in enumerate(assignments):
         if target_idx < 0:
@@ -715,12 +716,15 @@ def _score_assignment(
         target_hc = target.headcount or hc
         total_hc_mismatch += abs(hc - target_hc)
 
-        flows.append((freed_machine, target.machine_id, freed_time))
+        forced = len(feasible[i]) <= 1
+        flows.append((freed_machine, target.machine_id, freed_time, forced))
 
     # Count ping-pongs: A→B followed by B→A within 2 hours
-    for i, (f1, t1, time1) in enumerate(flows):
-        for f2, t2, time2 in flows[i + 1:]:
+    # Skip if either leg is a forced assignment (only one feasible target)
+    for i, (f1, t1, time1, forced1) in enumerate(flows):
+        for f2, t2, time2, forced2 in flows[i + 1:]:
             if (f1 == t2 and t1 == f2
+                    and not forced1 and not forced2
                     and abs((time2 - time1).total_seconds()) < 7200):
                 ping_pongs += 1
 
@@ -900,11 +904,14 @@ def _greedy_assignment(
         freed_time, freed_machine, hc, reason, source_entry = freed_events[idx]
         target = job_starts[target_idx]
 
-        reverse_key = (target.machine_id, freed_machine)
-        if reverse_key in recent_flows:
-            prev_time = recent_flows[reverse_key]
-            if abs((freed_time - prev_time).total_seconds()) < ping_pong_window.total_seconds():
-                continue
+        # Skip ping-pong check if this is a forced assignment (only one
+        # feasible target) — crew with no alternative should always jump.
+        if len(feasible[idx]) > 1:
+            reverse_key = (target.machine_id, freed_machine)
+            if reverse_key in recent_flows:
+                prev_time = recent_flows[reverse_key]
+                if abs((freed_time - prev_time).total_seconds()) < ping_pong_window.total_seconds():
+                    continue
 
         assignments[idx] = target_idx
         used_targets.add(target_idx)
