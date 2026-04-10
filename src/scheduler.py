@@ -146,8 +146,9 @@ def generate_schedule_from_jobs(
         return ScheduleResult([], [], skipped, 0.0, result.status)
 
     entries = _assemble_schedule(result, cfg)
-    if cfg.h3_enabled:
-        _stagger_changeovers(entries, cfg)
+    # H3 stagger disabled — solver-level NoOverlap on changeover intervals
+    # now handles separation.  The post-hoc stagger was re-introducing
+    # overlaps by sliding changeovers without the full constraint picture.
     crew_movements = _compute_crew_movements(entries, cfg)
 
     return ScheduleResult(
@@ -212,9 +213,12 @@ def _assemble_schedule(
             machine_co_hours = spec.changeover_hours if needs_upfront_co else 0.0
 
             if needs_upfront_co and gap_hours + 1e-3 >= machine_co_hours:
-                # Reserve the trailing `changeover_hours` of the gap for the CO.
-                machine_co_min = round(machine_co_hours * 60)
-                co_start_minute = max(0, first_sb.start_minute - machine_co_min)
+                # Use solver's changeover start if available
+                if first_sb.co_start_minute is not None:
+                    co_start_minute = first_sb.co_start_minute
+                else:
+                    machine_co_min = round(machine_co_hours * 60)
+                    co_start_minute = max(0, first_sb.start_minute - machine_co_min)
                 co_start_dt = _staffed_minute_to_datetime(
                     co_start_minute, schedule_start, spd
                 )
@@ -265,7 +269,13 @@ def _assemble_schedule(
 
             # Insert changeover before this batch if tool changed
             if prev_tool is not None and prev_tool != batch.tool_id and spec.has_changeovers:
-                co_start = prev_end if prev_end else batch_start_dt
+                # Use solver's changeover start if available, else fall back
+                if sb.co_start_minute is not None:
+                    co_start = _staffed_minute_to_datetime(
+                        sb.co_start_minute, schedule_start, spd
+                    )
+                else:
+                    co_start = prev_end if prev_end else batch_start_dt
                 co_hours = spec.changeover_hours
                 # Changeover consumes staffed time (skips non-working periods)
                 co_end = add_staffed_hours(co_start, co_hours, spd)
@@ -497,8 +507,31 @@ def _rebuild_idle_gaps(
 
 # ── Crew movement annotation ───────────────────────────────────────
 
+def _shift_boundaries_in_range(
+    t_min: datetime, t_max: datetime, cfg: SchedulerConfig
+) -> list[datetime]:
+    """Return shift boundary times (06:30, 14:30 on weekdays) in [t_min, t_max]."""
+    boundaries: set[datetime] = set()
+    boundaries.add(cfg.schedule_start)
+
+    current_date = t_min.date()
+    end_date = t_max.date()
+    while current_date <= end_date:
+        if current_date.weekday() < 5:  # Mon–Fri
+            for h, m in [(6, 30), (14, 30)]:
+                bt = datetime.combine(
+                    current_date, datetime.min.time().replace(hour=h, minute=m)
+                )
+                if t_min <= bt <= t_max:
+                    boundaries.add(bt)
+        current_date += timedelta(days=1)
+
+    return sorted(boundaries)
+
+
 def _collect_crew_events(
     entries: list[ScheduleEntry],
+    cfg: Optional[SchedulerConfig] = None,
 ) -> tuple[list[tuple], list[ScheduleEntry]]:
     """Collect freed-crew events and target job starts.
 
@@ -569,7 +602,30 @@ def _collect_crew_events(
         # ended into NOT_RUNNING before this changeover started).
         if (co.machine_id, prev_job.end) in freed_by_eow:
             continue
-        freed_events.append((co.start, co.machine_id, hc, "changeover", co))
+        # Free crew when the job ends, not when the changeover starts.
+        # The solver may slide changeovers later to avoid overlaps,
+        # leaving a gap where the crew is idle and can jump elsewhere.
+        freed_events.append((prev_job.end, co.machine_id, hc, "changeover", e))
+
+    # ── Seed crews at shift boundaries ──────────────────────────
+    #
+    # At each shift start (06:30, 14:30) fresh crews arrive. Jobs that
+    # begin at a boundary need crew but have no "freed" source — nobody
+    # has finished work yet. For each such job, create a synthetic freed
+    # event from CREW_POOL so the optimizer can assign it.
+    if cfg and entries:
+        t_min = min(e.start for e in entries)
+        t_max = max(e.end for e in entries)
+        boundaries = _shift_boundaries_in_range(t_min, t_max, cfg)
+        shift_tol = timedelta(minutes=5)
+
+        for js in job_starts:
+            for bt in boundaries:
+                if abs((js.start - bt).total_seconds()) <= shift_tol.total_seconds():
+                    freed_events.append(
+                        (bt, "CREW_POOL", js.headcount or 11.0, "shift_start", None)
+                    )
+                    break
 
     return freed_events, job_starts
 
@@ -866,7 +922,7 @@ def _compute_crew_movements(
     that minimize idle time, ping-pong movements, and HC mismatch.
     Falls back to greedy assignment if pymoo is unavailable.
     """
-    freed_events, job_starts = _collect_crew_events(entries)
+    freed_events, job_starts = _collect_crew_events(entries, cfg)
 
     if not freed_events or not job_starts:
         return []

@@ -39,6 +39,7 @@ class ScheduledBatch:
     batch: ToolBatch
     start_minute: int  # in staffed-minutes timeline
     end_minute: int
+    co_start_minute: Optional[int] = None  # changeover start (staffed min), if any
 
 
 @dataclass
@@ -291,6 +292,10 @@ def solve_schedule(
     # these prevents two maintenance changeovers from running simultaneously.
     co_intervals: list[cp_model.IntervalVar] = []
 
+    # Track changeover start variables so we can extract them after solving.
+    # co_start_vars[batch_id] = [(arc_lit, co_start_var), ...]
+    co_start_vars: dict[int, list[tuple[cp_model.IntVar, cp_model.IntVar]]] = {}
+
     for machine_id, m_batches in machine_batches.items():
         if not m_batches:
             continue
@@ -330,6 +335,9 @@ def solve_schedule(
                 )
                 co_intervals.append(co_iv)
                 co_penalty_terms.append((first_lit, machine_co))
+                # Track: initial CO starts at minute 0
+                ico_start = model.new_int_var(0, 0, f"ico_s_{machine_id}_{bi.batch_id}")
+                co_start_vars.setdefault(bi.batch_id, []).append((first_lit, ico_start))
 
             # Arc: batch i+1 → depot (0) — batch i is last
             last_lit = model.new_bool_var(f"last_{machine_id}_{bi.batch_id}")
@@ -350,11 +358,12 @@ def solve_schedule(
                 gap = machine_co if bi.tool_id != bj.tool_id else 0
 
                 if gap > 0:
-                    # Explicit changeover interval: starts when batch i ends,
-                    # batch j starts after changeover completes.
+                    # Explicit changeover interval: can slide anywhere in the
+                    # gap between batch i end and batch j start.  The NoOverlap
+                    # constraint prevents two changeovers from running at once.
                     co_start = model.new_int_var(0, horizon, f"co_s_{machine_id}_{bi.batch_id}_{bj.batch_id}")
                     co_end_var = model.new_int_var(0, horizon, f"co_e_{machine_id}_{bi.batch_id}_{bj.batch_id}")
-                    model.add(co_start == ends[bi.batch_id]).only_enforce_if(lit)
+                    model.add(co_start >= ends[bi.batch_id]).only_enforce_if(lit)
                     model.add(co_end_var == co_start + gap).only_enforce_if(lit)
                     model.add(starts[bj.batch_id] >= co_end_var).only_enforce_if(lit)
 
@@ -366,6 +375,8 @@ def solve_schedule(
 
                     co_penalty_terms.append((lit, gap))
                     co_arcs.setdefault(machine_id, {})[(i, j)] = lit
+                    # Track: CO before batch j when arc i→j is active
+                    co_start_vars.setdefault(bj.batch_id, []).append((lit, co_start))
                 else:
                     model.add(
                         starts[bj.batch_id] >= ends[bi.batch_id]
@@ -584,7 +595,13 @@ def solve_schedule(
     for b in batches:
         s = solver.value(starts[b.batch_id])
         e = solver.value(ends[b.batch_id])
-        scheduled.append(ScheduledBatch(batch=b, start_minute=s, end_minute=e))
+        # Extract changeover start for this batch (if any arc with CO is active)
+        co_min: Optional[int] = None
+        for lit, co_var in co_start_vars.get(b.batch_id, []):
+            if solver.value(lit):
+                co_min = solver.value(co_var)
+                break
+        scheduled.append(ScheduledBatch(batch=b, start_minute=s, end_minute=e, co_start_minute=co_min))
 
     # Sort by start time for readability
     scheduled.sort(key=lambda sb: (sb.start_minute, sb.batch.machine_id))
