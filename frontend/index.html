@@ -45,7 +45,6 @@
       <label class="ticket-toggle"><input type="checkbox" id="inclWhite"><span class="ticket-chip white">White</span></label>
     </div>
     <label class="ticket-toggle"><input type="checkbox" id="prioBoost"><span class="ticket-chip boost">P+ Boost</span></label>
-    <label class="ticket-toggle"><input type="checkbox" id="minimizeLate"><span class="ticket-chip late-mode">Min Late</span></label>
     <button class="day-btn" onclick="toggleShiftPanel()">Shifts</button>
     <button class="day-btn" onclick="toggleMachinePanel()">Machines</button>
   </div>
@@ -127,7 +126,16 @@
 </div>
 
 <div class="content">
-  <div class="loading" id="loading"><div class="spinner"></div><div>Generating schedule...</div></div>
+  <div class="loading" id="loading">
+    <div class="spinner"></div>
+    <div>Generating schedule...</div>
+    <div id="solveTimer" style="margin-top:8px;font-size:13px;font-variant-numeric:tabular-nums;"></div>
+    <div style="margin-top:12px;width:260px;margin-left:auto;margin-right:auto;">
+      <div id="solveBarBg" style="display:none;height:6px;border-radius:3px;background:var(--border);overflow:hidden;">
+        <div id="solveBarFill" style="height:100%;width:0%;border-radius:3px;background:var(--accent);transition:width 1s linear;"></div>
+      </div>
+    </div>
+  </div>
   <div class="empty-state" id="emptyState">
     <h2>Upload an Excel schedule file to get started</h2>
     <p>Select a file and click Generate Schedule</p>
@@ -476,6 +484,26 @@ async function runSchedule() {
   if (!selectedFile) return;
   document.getElementById('emptyState').style.display = 'none';
   document.getElementById('loading').classList.add('show');
+  // Estimate solve time: 200s base × complexity multiplier
+  const prio = document.getElementById('prioBoost').checked;
+  const complexity = 1 + (prio ? 1 : 0);
+  const estSeconds = 200 * complexity;
+  // Start elapsed timer + progress bar
+  const timerEl = document.getElementById('solveTimer');
+  const barBg = document.getElementById('solveBarBg');
+  const barFill = document.getElementById('solveBarFill');
+  barBg.style.display = 'block';
+  barFill.style.width = '0%';
+  const t0 = Date.now();
+  const timerIv = setInterval(() => {
+    const sec = Math.floor((Date.now() - t0) / 1000);
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    const pct = Math.min(99, (sec / estSeconds) * 100);
+    timerEl.textContent = (m > 0 ? m + 'm ' : '') + s + 's elapsed';
+    barFill.style.width = pct.toFixed(1) + '%';
+  }, 1000);
+  timerEl.textContent = '0s elapsed';
   document.getElementById('statsBar').style.display = 'none';
   document.getElementById('tabsBar').style.display = 'none';
   document.getElementById('exportBtn').style.display = 'none';
@@ -494,7 +522,7 @@ async function runSchedule() {
   formData.append('include_white', document.getElementById('inclWhite').checked);
   formData.append('initial_tools', JSON.stringify(getInitialTools()));
   formData.append('priority_boost', document.getElementById('prioBoost').checked);
-  formData.append('minimize_late', document.getElementById('minimizeLate').checked);
+  formData.append('minimize_late', false);
   formData.append('disabled_machines', JSON.stringify(getDisabledMachines()));
   const groups = getMachineGroups();
   if (Object.keys(groups).length > 0) {
@@ -504,10 +532,15 @@ async function runSchedule() {
   try {
     const resp = await fetch('/api/schedule', { method: 'POST', body: formData });
     scheduleData = await resp.json();
+    clearInterval(timerIv);
+    barFill.style.width = '100%';
     document.getElementById('loading').classList.remove('show');
+    barBg.style.display = 'none';
     onScheduleLoaded();
   } catch (err) {
+    clearInterval(timerIv);
     document.getElementById('loading').classList.remove('show');
+    barBg.style.display = 'none';
     alert('Error: ' + err.message);
   }
 }
@@ -530,7 +563,7 @@ function saveScheduleJson() {
       include_pink: document.getElementById('inclPink').checked,
       include_white: document.getElementById('inclWhite').checked,
       priority_boost: document.getElementById('prioBoost').checked,
-      minimize_late: document.getElementById('minimizeLate').checked,
+      minimize_late: false,
       shift_config: shiftConfig,
       disabled_machines: getDisabledMachines(),
       initial_tools: getInitialTools(),
@@ -769,7 +802,6 @@ function restoreConfig(config) {
   if (config.include_pink !== undefined) document.getElementById('inclPink').checked = config.include_pink;
   if (config.include_white !== undefined) document.getElementById('inclWhite').checked = config.include_white;
   if (config.priority_boost !== undefined) document.getElementById('prioBoost').checked = config.priority_boost;
-  if (config.minimize_late !== undefined) document.getElementById('minimizeLate').checked = config.minimize_late;
   if (config.shift_config && typeof config.shift_config === 'object') {
     shiftConfig = config.shift_config;
     initShiftGrid();

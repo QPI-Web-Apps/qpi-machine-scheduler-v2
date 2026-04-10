@@ -88,7 +88,6 @@ header h1 span { color: var(--accent); font-weight: 700; }
 .ticket-toggle input:checked + .ticket-chip.pink { background: #ec4899; border-color: #ec4899; color: #fff; }
 .ticket-toggle input:checked + .ticket-chip.white { background: #e2e8f0; border-color: #e2e8f0; color: #1e1b18; }
 .ticket-toggle input:checked + .ticket-chip.boost { background: #ef4444; border-color: #ef4444; color: #fff; }
-.ticket-toggle input:checked + .ticket-chip.late-mode { background: #f59e0b; border-color: #f59e0b; color: #fff; }
 
 .upload-btn, .run-btn {
   padding: 5px 12px; border-radius: 4px;

@@ -76,7 +76,7 @@ def assign_jobs_to_machines(
     for _eligible_set, group_jobs in multi_eligible.items():
         _assign_multi_machine_group(
             group_jobs, machine_jobs,
-            minimize_changeovers=cfg.priority_boost,
+            minimize_changeovers=True,
         )
 
     return machine_jobs
@@ -435,6 +435,78 @@ def solve_schedule(
                 penalty = 2 * machine_co
                 crew_sandwich_terms.append((sandwich_lit, penalty))
 
+    # ── Crew-idle penalty ───────────────────────────────────────
+    #
+    # When a maintenance changeover starts on machine M, crew is freed.
+    # Penalize the gap between crew-free time and the nearest batch
+    # start on ANY other machine so the solver aligns changeovers
+    # with job starts — freed crew should always have a job to land on.
+
+    CREW_IDLE_WEIGHT = 10  # harsh: 10× per minute of idle
+    crew_idle_terms: list = []
+
+    # Pre-build other-machine batch lists
+    other_batches_for: dict[str, list[ToolBatch]] = {}
+    for mid in machine_batches:
+        other_batches_for[mid] = [b for b in batches if b.machine_id != mid]
+
+    for machine_id, arcs_dict in co_arcs.items():
+        spec = MACHINE_BY_ID[machine_id]
+        # Only maintenance changeovers free crew (skip LMB/SMB self-service)
+        if spec.self_service_changeover:
+            continue
+
+        m_batches_local = machine_batches[machine_id]
+        candidates = other_batches_for[machine_id]
+        if not candidates:
+            continue
+
+        for (i, j), lit_ij in arcs_dict.items():
+            bi = m_batches_local[i]
+            crew_free = ends[bi.batch_id]
+
+            gap_vars = []
+            for cand in candidates:
+                # after_cand: True iff candidate starts at/after crew_free
+                after_cand = model.new_bool_var(
+                    f"cidle_af_{bi.batch_id}_{cand.batch_id}"
+                )
+                model.add(
+                    starts[cand.batch_id] >= crew_free
+                ).only_enforce_if(after_cand)
+                model.add(
+                    starts[cand.batch_id] < crew_free
+                ).only_enforce_if(~after_cand)
+
+                # gap: actual gap if after, horizon sentinel if before
+                gap_cand = model.new_int_var(
+                    0, horizon,
+                    f"cidle_g_{bi.batch_id}_{cand.batch_id}"
+                )
+                model.add(
+                    gap_cand == starts[cand.batch_id] - crew_free
+                ).only_enforce_if(after_cand)
+                model.add(
+                    gap_cand == horizon
+                ).only_enforce_if(~after_cand)
+
+                gap_vars.append(gap_cand)
+
+            # Nearest future batch start on another machine
+            min_gap = model.new_int_var(
+                0, horizon, f"cidle_min_{bi.batch_id}_{j}"
+            )
+            model.add_min_equality(min_gap, gap_vars)
+
+            # Gate by arc literal — only penalize active changeovers
+            idle_pen = model.new_int_var(
+                0, horizon, f"cidle_pen_{bi.batch_id}_{j}"
+            )
+            model.add(idle_pen == min_gap).only_enforce_if(lit_ij)
+            model.add(idle_pen == 0).only_enforce_if(~lit_ij)
+
+            crew_idle_terms.append(idle_pen)
+
     # ── Max concurrent machines (cumulative) ────────────────────
 
     all_intervals = [intervals[b.batch_id] for b in batches]
@@ -535,7 +607,7 @@ def solve_schedule(
 
     # ── Layer 4c: Changeover penalty (priority_boost mode) ──────
     co_term = 0
-    if cfg.priority_boost and co_penalty_terms:
+    if co_penalty_terms:
         co_term = sum(lit * pen for lit, pen in co_penalty_terms)
 
     # ── Layer 4d: Crew-sandwich penalty ──────────────────────────
@@ -544,12 +616,15 @@ def solve_schedule(
         sandwich_term = sum(lit * pen for lit, pen in crew_sandwich_terms)
 
     # ── Layer 4e: Compactness — push batches to start early ────
-    # Without this, non-critical-path batches float freely and may
-    # start long after their changeover finishes, leaving machines
-    # idle with tool loaded.  A tiny weight ensures the solver
-    # prefers earlier starts as a tiebreaker without overriding
-    # makespan, priority, or other objectives.
-    compact_term = sum(starts[b.batch_id] for b in batches)
+    # Weight of 3 per batch matches the P+ boost push-early force,
+    # ensuring batches start at the shift boundary (e.g. 06:30)
+    # rather than drifting later.
+    compact_term = 3 * sum(starts[b.batch_id] for b in batches)
+
+    # ── Layer 4f: Crew-idle penalty ──────────────────────────────
+    crew_idle_term = 0
+    if crew_idle_terms:
+        crew_idle_term = CREW_IDLE_WEIGHT * sum(crew_idle_terms)
 
     # ── Combine layers ─────────────────────────────────────────
     # late_term >> prio_term >> makespan + hc_term + co_term + compact
@@ -559,7 +634,7 @@ def solve_schedule(
     )
     has_late = cfg.minimize_late and (late_vars or tardiness_vars)
 
-    objective = makespan + hc_term + co_term + sandwich_term + compact_term
+    objective = makespan + hc_term + co_term + sandwich_term + crew_idle_term + compact_term
     if has_prio:
         objective += prio_term * n_batches
     if has_late:
@@ -571,7 +646,7 @@ def solve_schedule(
 
     solver = cp_model.CpSolver()
     # More objective terms → harder problem → more time
-    complexity = 1 + (1 if cfg.minimize_late else 0) + (1 if cfg.priority_boost else 0)
+    complexity = 1 + (1 if cfg.priority_boost else 0)
     effective_limit = time_limit_seconds * complexity
     solver.parameters.max_time_in_seconds = effective_limit
     solver.parameters.num_workers = 8
