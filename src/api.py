@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
@@ -42,8 +43,19 @@ _results: dict[str, dict] = {}
 # scheduled JOB entries to yellow/pink ones).
 _YELLOW_PINK_RE = re.compile(r"yellow|pink", re.IGNORECASE)
 
+# Debug: last run result (in-memory) + disk path
+_last_run: dict | None = None
+_DEBUG_DIR = Path(__file__).parent.parent / "debug"
+
 
 # ── Helpers ─────────────────────────────────────────────────────────
+
+def _cfg_to_json(cfg: SchedulerConfig) -> dict:
+    """Serialize SchedulerConfig to JSON-friendly dict."""
+    d = dataclasses.asdict(cfg)
+    d["schedule_start"] = cfg.schedule_start.isoformat()
+    return d
+
 
 def _result_to_json(result: ScheduleResult, cfg: SchedulerConfig) -> dict:
     """Serialize a ScheduleResult into JSON-friendly dict."""
@@ -421,7 +433,128 @@ async def create_schedule(
         "all_yp_jobs": all_yp_jobs,
     }
 
+    # Debug: persist last run for debugging
+    global _last_run
+    debug_data = {
+        "config": _cfg_to_json(cfg),
+        "machine_groups": parsed_groups or None,
+        "max_concurrent": max_concurrent,
+        **response_data,
+    }
+    _last_run = debug_data
+    _DEBUG_DIR.mkdir(exist_ok=True)
+    (_DEBUG_DIR / "last_run.json").write_text(
+        json.dumps(debug_data, default=str, indent=2)
+    )
+
+    # Persist run to DB for cross-restart history
+    # NOTE: prisma-client-py parameterized queries are broken on SQL Server
+    # (type inference maps params to money). Use inline SQL — safe because
+    # schedule_id is server-generated and JSON is our own serialization.
+    try:
+        db = _get_prisma()
+        config_str = json.dumps(debug_data.get("config"), default=str).replace("'", "''")
+        result_str = json.dumps({
+            k: debug_data[k]
+            for k in ("schedule", "machines", "crew_movements", "skipped_jobs",
+                       "machine_groups", "max_concurrent", "groups",
+                       "germantown_jobs")
+            if k in debug_data
+        }, default=str).replace("'", "''")
+        status = response_data.get("solver_status", "UNKNOWN")
+        total_jobs = response_data.get("total_jobs", 0)
+        makespan = response_data.get("makespan_hours", 0)
+        skipped = response_data.get("skipped_count", 0)
+        crew_count = len(response_data.get("crew_movements", []))
+        db.execute_raw(
+            f"""INSERT INTO scheduler_runs
+                (run_id, created_at, solver_status, total_jobs, makespan_hours,
+                 skipped_count, crew_movements, config_json, result_json)
+            VALUES
+                ('{schedule_id}', GETUTCDATE(), '{status}', {total_jobs},
+                 {makespan}, {skipped}, {crew_count},
+                 '{config_str}', '{result_str}')"""
+        )
+    except Exception as exc:
+        print(f"[scheduler_runs] Failed to persist run {schedule_id}: {exc}")
+
     return JSONResponse(response_data)
+
+
+@app.get("/api/last-result")
+def get_last_result():
+    """Return the most recent schedule run (config + full result) for debugging."""
+    if _last_run is None:
+        return JSONResponse({"error": "No schedule has been generated yet"}, status_code=404)
+    return JSONResponse(_last_run)
+
+
+@app.get("/api/runs")
+def list_runs():
+    """List recent scheduler runs (metadata only, no large JSON blobs)."""
+    try:
+        db = _get_prisma()
+    except Exception as exc:
+        return JSONResponse({"error": "Database connection failed", "detail": str(exc)}, status_code=503)
+
+    rows = db.query_raw(
+        """
+        SELECT TOP 50 id, run_id, created_at, solver_status,
+               total_jobs, makespan_hours, skipped_count, crew_movements, note
+        FROM scheduler_runs
+        ORDER BY created_at DESC
+        """,
+    )
+    # Serialize datetime objects
+    for r in rows:
+        if "created_at" in r and hasattr(r["created_at"], "isoformat"):
+            r["created_at"] = r["created_at"].isoformat()
+    return JSONResponse({"runs": rows})
+
+
+@app.get("/api/runs/{run_id}")
+def get_run(run_id: str):
+    """Fetch a specific run with full config + result JSON."""
+    try:
+        db = _get_prisma()
+    except Exception as exc:
+        return JSONResponse({"error": "Database connection failed", "detail": str(exc)}, status_code=503)
+
+    # Sanitize run_id (should be 8 hex chars)
+    safe_id = re.sub(r"[^a-fA-F0-9]", "", run_id)[:8]
+    rows = db.query_raw(
+        f"SELECT * FROM scheduler_runs WHERE run_id = '{safe_id}'",
+    )
+    if not rows:
+        return JSONResponse({"error": "Run not found"}, status_code=404)
+
+    row = rows[0]
+    # Parse the JSON blobs back into objects for the response
+    row["config"] = json.loads(row["config_json"])
+    row["result"] = json.loads(row["result_json"])
+    del row["config_json"]
+    del row["result_json"]
+    # Serialize any remaining datetime/Decimal objects
+    return JSONResponse(json.loads(json.dumps(row, default=str)))
+
+
+@app.patch("/api/runs/{run_id}")
+def update_run_note(run_id: str, body: dict = Body(...)):
+    """Update the note on a run (for labeling: 'baseline', 'testing groups', etc)."""
+    note = body.get("note", "")
+    try:
+        db = _get_prisma()
+    except Exception as exc:
+        return JSONResponse({"error": "Database connection failed", "detail": str(exc)}, status_code=503)
+
+    safe_id = re.sub(r"[^a-fA-F0-9]", "", run_id)[:8]
+    safe_note = note[:255].replace("'", "''")
+    count = db.execute_raw(
+        f"UPDATE scheduler_runs SET note = '{safe_note}' WHERE run_id = '{safe_id}'",
+    )
+    if count == 0:
+        return JSONResponse({"error": "Run not found"}, status_code=404)
+    return JSONResponse({"ok": True, "run_id": run_id, "note": note[:255]})
 
 
 @app.get("/api/schedule/{schedule_id}")

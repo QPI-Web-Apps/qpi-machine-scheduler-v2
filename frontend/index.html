@@ -54,14 +54,10 @@
 <div class="machine-toggle-panel collapsed" id="machineTogglePanel">
   <div class="mg-mode-bar">
     <div class="mg-mode-toggle">
-      <button class="mg-mode-btn active" id="modeSingle" onclick="setGroupMode('single')">Single Pool</button>
-      <button class="mg-mode-btn" id="modeMulti" onclick="setGroupMode('multi')">Crew Groups</button>
+      <span style="font-size:0.85em;color:var(--text-secondary);padding:6px 10px;">Crew Groups</span>
     </div>
   </div>
-  <div id="singleGroupMode">
-    <div class="mt-row" id="machineToggles"></div>
-  </div>
-  <div id="multiGroupMode" style="display:none;">
+  <div id="multiGroupMode">
     <div id="groupGrid"></div>
   </div>
 </div>
@@ -117,6 +113,7 @@
   <div class="stat-card"><div class="label">On Time</div><div class="value green" id="statOnTime">-</div></div>
   <div class="stat-card"><div class="label">Past Due</div><div class="value" id="statPastDue" style="color:var(--red)">-</div></div>
   <div class="stat-card"><div class="label">Will Finish Late</div><div class="value orange" id="statLate">-</div></div>
+  <div class="stat-card"><div class="label">Run ID</div><div class="value" id="statRunId" style="font-size:0.85em;letter-spacing:0.5px">-</div></div>
 </div>
 
 <div class="tabs" id="tabsBar" style="display:none;">
@@ -396,48 +393,22 @@ function getInitialTools() {
   return tools;
 }
 
-// ── Machine Toggles & Groups ──────────────────────────
-const enabledMachines = {};
-MACHINE_ORDER.forEach(mid => { enabledMachines[mid] = true; });
-
-let groupMode = 'single';
-const GROUP_NAMES = ['A', 'B', 'C', 'D'];
-const GROUP_COLORS = { A: '#3b82f6', B: '#f59e0b', C: '#8b5cf6', D: '#22c55e' };
-let machineGroupAssignments = {}; // mid -> group name or null
-let activeGroupCount = 2;
-let groupMaxConcurrent = { A: 5, B: 5, C: 5, D: 5 };
-
-function setGroupMode(mode) {
-  groupMode = mode;
-  document.getElementById('modeSingle').className = 'mt-btn ' + (mode === 'single' ? 'on' : 'off');
-  document.getElementById('modeMulti').className = 'mt-btn ' + (mode === 'multi' ? 'on' : 'off');
-  document.getElementById('singleGroupMode').style.display = mode === 'single' ? '' : 'none';
-  document.getElementById('multiGroupMode').style.display = mode === 'multi' ? '' : 'none';
-  if (mode === 'multi') renderGroupGrid();
-}
-
-function addGroup() {
-  if (activeGroupCount < 4) { activeGroupCount++; renderGroupGrid(); }
-}
-function removeGroup() {
-  if (activeGroupCount > 2) {
-    const removed = GROUP_NAMES[activeGroupCount - 1];
-    MACHINE_ORDER.forEach(mid => { if (machineGroupAssignments[mid] === removed) machineGroupAssignments[mid] = null; });
-    activeGroupCount--;
-    renderGroupGrid();
-  }
-}
+// ── Machine Groups (hardcoded) ───────────────────────
+const GROUP_NAMES = ['A', 'B'];
+const GROUP_COLORS = { A: '#3b82f6', B: '#f59e0b' };
+const HARDCODED_GROUPS = {
+  '16A': 'A', '16B': 'A', '16C': 'A', '20': 'A', '8': 'A', 'RF': 'A',
+  'LMB': 'B', 'SMB': 'B', '6ST': 'B',
+};
+let groupMaxConcurrent = { A: 3, B: 1 };
 
 function renderGroupGrid() {
-  const groups = GROUP_NAMES.slice(0, activeGroupCount);
   let html = '';
 
-  // Group controls bar
+  // Per-group max concurrent controls
   html += '<div class="mg-controls">';
-  html += `<button class="mg-add-btn" onclick="addGroup()" ${activeGroupCount >= 4 ? 'disabled' : ''}>+ Group</button>`;
-  html += `<button class="mg-add-btn" onclick="removeGroup()" ${activeGroupCount <= 2 ? 'disabled' : ''}>- Group</button>`;
-  // Per-group max concurrent
-  groups.forEach(g => {
+  GROUP_NAMES.forEach(g => {
+    const machines = MACHINE_ORDER.filter(mid => HARDCODED_GROUPS[mid] === g);
     html += `<div class="mg-max-input"><span class="mg-max-dot" style="background:${GROUP_COLORS[g]}"></span>`;
     html += `<span class="mg-max-label">${g} max</span>`;
     html += `<input type="number" min="1" max="9" value="${groupMaxConcurrent[g]}" class="mg-max-field" onchange="groupMaxConcurrent['${g}']=parseInt(this.value)">`;
@@ -445,24 +416,18 @@ function renderGroupGrid() {
   });
   html += '</div>';
 
-  // Machine assignment — each machine is a row of clickable group chips
+  // Machine list — display-only, showing which group each belongs to
   html += '<div class="mg-machine-list">';
   MACHINE_ORDER.forEach(mid => {
-    const assigned = machineGroupAssignments[mid] || null;
+    const assigned = HARDCODED_GROUPS[mid];
     html += `<div class="mg-machine-row">`;
     html += `<div class="mg-machine-name">${mid}</div>`;
     html += `<div class="mg-chips">`;
-    groups.forEach(g => {
+    GROUP_NAMES.forEach(g => {
       const isActive = assigned === g;
-      const style = isActive ? `background:${GROUP_COLORS[g]};border-color:${GROUP_COLORS[g]};color:#fff` : '';
-      html += `<button class="mg-chip ${isActive ? 'active' : ''}" style="${style}" onclick="assignMachineGroup('${mid}','${assigned === '${g}' ? null : '${g}'}')"`;
-      // Use a cleaner onclick with proper escaping
-      html = html.slice(0, html.lastIndexOf('onclick='));
-      html += `onclick="assignMachineGroup('${mid}',${assigned === g ? 'null' : "'" + g + "'"})">${g}</button>`;
+      const style = isActive ? `background:${GROUP_COLORS[g]};border-color:${GROUP_COLORS[g]};color:#fff` : 'opacity:0.3;cursor:default';
+      html += `<span class="mg-chip ${isActive ? 'active' : ''}" style="${style}">${g}</span>`;
     });
-    // "Off" chip
-    const offActive = !assigned;
-    html += `<button class="mg-chip mg-chip-off ${offActive ? 'active' : ''}" onclick="assignMachineGroup('${mid}',null)">Off</button>`;
     html += `</div></div>`;
   });
   html += '</div>';
@@ -470,16 +435,10 @@ function renderGroupGrid() {
   document.getElementById('groupGrid').innerHTML = html;
 }
 
-function assignMachineGroup(mid, group) {
-  machineGroupAssignments[mid] = group;
-  renderGroupGrid();
-}
-
 function getMachineGroups() {
-  if (groupMode !== 'multi') return {};
   const groups = {};
-  GROUP_NAMES.slice(0, activeGroupCount).forEach(g => {
-    const machines = MACHINE_ORDER.filter(mid => machineGroupAssignments[mid] === g);
+  GROUP_NAMES.forEach(g => {
+    const machines = MACHINE_ORDER.filter(mid => HARDCODED_GROUPS[mid] === g);
     if (machines.length > 0) {
       groups[g] = { machines, max_concurrent: groupMaxConcurrent[g] || 5 };
     }
@@ -487,36 +446,18 @@ function getMachineGroups() {
   return groups;
 }
 
-function renderMachineToggles() {
-  const container = document.getElementById('machineToggles');
-  let html = '';
-  MACHINE_ORDER.forEach(mid => {
-    const on = enabledMachines[mid];
-    html += `<button class="mt-btn ${on ? 'on' : 'off'}" onclick="toggleMachine('${mid}')">${mid}</button>`;
-  });
-  container.innerHTML = html;
-}
-
-function toggleMachine(mid) {
-  enabledMachines[mid] = !enabledMachines[mid];
-  renderMachineToggles();
-}
-
 function toggleMachinePanel() {
   document.getElementById('machineTogglePanel').classList.toggle('collapsed');
 }
 
 function getDisabledMachines() {
-  if (groupMode === 'multi') {
-    return MACHINE_ORDER.filter(mid => !machineGroupAssignments[mid]);
-  }
-  return MACHINE_ORDER.filter(mid => !enabledMachines[mid]);
+  return [];
 }
 
 // Init grid on page load
 initShiftGrid();
 renderInitialTools();
-renderMachineToggles();
+renderGroupGrid();
 
 // ── Tabs ───────────────────────────────────────────────
 document.querySelectorAll('.tab').forEach(tab => {
@@ -593,10 +534,7 @@ function saveScheduleJson() {
       shift_config: shiftConfig,
       disabled_machines: getDisabledMachines(),
       initial_tools: getInitialTools(),
-      group_mode: groupMode,
       machine_groups: getMachineGroups(),
-      machine_group_assignments: machineGroupAssignments,
-      active_group_count: activeGroupCount,
       group_max_concurrent: groupMaxConcurrent
     },
     scheduleData: scheduleData
@@ -844,18 +782,9 @@ function restoreConfig(config) {
       if (el) el.value = val;
     });
   }
-  if (config.disabled_machines && Array.isArray(config.disabled_machines)) {
-    MACHINE_ORDER.forEach(mid => {
-      enabledMachines[mid] = !config.disabled_machines.includes(mid);
-    });
-    renderMachineToggles();
-  }
-  if (config.group_mode) {
-    groupMode = config.group_mode;
-    if (config.machine_group_assignments) machineGroupAssignments = config.machine_group_assignments;
-    if (config.active_group_count) activeGroupCount = config.active_group_count;
-    if (config.group_max_concurrent) Object.assign(groupMaxConcurrent, config.group_max_concurrent);
-    setGroupMode(groupMode);
+  if (config.group_max_concurrent) {
+    Object.assign(groupMaxConcurrent, config.group_max_concurrent);
+    renderGroupGrid();
   }
 }
 
@@ -875,6 +804,7 @@ function onScheduleLoaded() {
   document.getElementById('statMakespan').textContent = scheduleData.makespan_hours + 'h';
   document.getElementById('statCrew').textContent = scheduleData.crew_movements.length;
   document.getElementById('statSkipped').textContent = scheduleData.skipped_count;
+  document.getElementById('statRunId').textContent = scheduleData.schedule_id || '-';
 
   // Delivery stats
   let onTime = 0, pastDue = 0, finishLate = 0;
