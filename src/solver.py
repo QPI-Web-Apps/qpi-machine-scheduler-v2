@@ -235,9 +235,10 @@ def solve_schedule(
 
     model = cp_model.CpModel()
 
-    # Horizon: sum of all work + worst-case changeovers (generous upper bound)
-    total_work = sum(b.total_minutes for b in batches)
-    # Each machine can have at most (num_batches - 1) changeovers
+    # Horizon: max single-machine load + total changeover serialization + buffer.
+    # Machines run in parallel, so the schedule length is bounded by the
+    # most loaded machine, not the sum of all work.  Changeovers are
+    # serialized (no-overlap), so we add total_co as worst-case blocking.
     machine_batch_counts: dict[str, int] = {}
     for b in batches:
         machine_batch_counts[b.machine_id] = machine_batch_counts.get(b.machine_id, 0) + 1
@@ -246,7 +247,15 @@ def solve_schedule(
         for mid, count in machine_batch_counts.items()
         if MACHINE_BY_ID[mid].has_changeovers
     )
-    horizon = total_work + total_co + 480  # extra shift buffer
+    # Per-machine load: work + that machine's own changeovers
+    machine_loads: dict[str, int] = {}
+    for mid, count in machine_batch_counts.items():
+        work = sum(b.total_minutes for b in batches if b.machine_id == mid)
+        co = (max(0, count - 1) * round(MACHINE_BY_ID[mid].changeover_hours * 60)
+              if MACHINE_BY_ID[mid].has_changeovers else 0)
+        machine_loads[mid] = work + co
+    max_machine_load = max(machine_loads.values()) if machine_loads else 0
+    horizon = max_machine_load + total_co + 480  # + serialized CO blocking + shift buffer
 
     # ── Variables ────────────────────────────────────────────────
 
@@ -443,12 +452,21 @@ def solve_schedule(
     # with job starts — freed crew should always have a job to land on.
 
     CREW_IDLE_WEIGHT = 10  # harsh: 10× per minute of idle
+    CREW_IDLE_CAP = 480    # cap at one shift — beyond this is equally bad
     crew_idle_terms: list = []
 
     # Pre-build other-machine batch lists
     other_batches_for: dict[str, list[ToolBatch]] = {}
     for mid in machine_batches:
         other_batches_for[mid] = [b for b in batches if b.machine_id != mid]
+
+    # Shared cap constant for capping penalties
+    cap_const = model.new_int_var(CREW_IDLE_CAP, CREW_IDLE_CAP, "cidle_cap")
+
+    # Deduplicate: compute gap once per unique source batch (bi),
+    # share min_gap across all arcs involving that bi.
+    # Collect which (machine_id, bi, arcs) need processing.
+    bi_gap_cache: dict[int, cp_model.IntVar] = {}  # batch_id -> capped min_gap
 
     for machine_id, arcs_dict in co_arcs.items():
         spec = MACHINE_BY_ID[machine_id]
@@ -463,46 +481,43 @@ def solve_schedule(
 
         for (i, j), lit_ij in arcs_dict.items():
             bi = m_batches_local[i]
-            crew_free = ends[bi.batch_id]
 
-            gap_vars = []
-            for cand in candidates:
-                # after_cand: True iff candidate starts at/after crew_free
-                after_cand = model.new_bool_var(
-                    f"cidle_af_{bi.batch_id}_{cand.batch_id}"
+            # Compute gap vars once per unique bi
+            if bi.batch_id not in bi_gap_cache:
+                crew_free = ends[bi.batch_id]
+
+                gap_vars = []
+                for cand in candidates:
+                    # abs-distance: gap >= |starts[cand] - crew_free|
+                    # Solver pushes to equality through minimization
+                    gap_cand = model.new_int_var(
+                        0, horizon,
+                        f"cidle_g_{bi.batch_id}_{cand.batch_id}"
+                    )
+                    model.add(gap_cand >= starts[cand.batch_id] - crew_free)
+                    model.add(gap_cand >= crew_free - starts[cand.batch_id])
+                    gap_vars.append(gap_cand)
+
+                # Nearest batch start on another machine (abs distance)
+                min_gap = model.new_int_var(
+                    0, horizon, f"cidle_min_{bi.batch_id}"
                 )
-                model.add(
-                    starts[cand.batch_id] >= crew_free
-                ).only_enforce_if(after_cand)
-                model.add(
-                    starts[cand.batch_id] < crew_free
-                ).only_enforce_if(~after_cand)
+                model.add_min_equality(min_gap, gap_vars)
 
-                # gap: actual gap if after, horizon sentinel if before
-                gap_cand = model.new_int_var(
-                    0, horizon,
-                    f"cidle_g_{bi.batch_id}_{cand.batch_id}"
+                # Cap at one shift
+                capped = model.new_int_var(
+                    0, CREW_IDLE_CAP, f"cidle_cap_{bi.batch_id}"
                 )
-                model.add(
-                    gap_cand == starts[cand.batch_id] - crew_free
-                ).only_enforce_if(after_cand)
-                model.add(
-                    gap_cand == horizon
-                ).only_enforce_if(~after_cand)
+                model.add_min_equality(capped, [min_gap, cap_const])
 
-                gap_vars.append(gap_cand)
-
-            # Nearest future batch start on another machine
-            min_gap = model.new_int_var(
-                0, horizon, f"cidle_min_{bi.batch_id}_{j}"
-            )
-            model.add_min_equality(min_gap, gap_vars)
+                bi_gap_cache[bi.batch_id] = capped
 
             # Gate by arc literal — only penalize active changeovers
+            capped_gap = bi_gap_cache[bi.batch_id]
             idle_pen = model.new_int_var(
-                0, horizon, f"cidle_pen_{bi.batch_id}_{j}"
+                0, CREW_IDLE_CAP, f"cidle_pen_{bi.batch_id}_{j}"
             )
-            model.add(idle_pen == min_gap).only_enforce_if(lit_ij)
+            model.add(idle_pen == capped_gap).only_enforce_if(lit_ij)
             model.add(idle_pen == 0).only_enforce_if(~lit_ij)
 
             crew_idle_terms.append(idle_pen)
