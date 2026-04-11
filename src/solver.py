@@ -9,6 +9,7 @@ Three stages:
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -451,7 +452,14 @@ def solve_schedule(
     # start on ANY other machine so the solver aligns changeovers
     # with job starts — freed crew should always have a job to land on.
 
-    CREW_IDLE_WEIGHT = 10  # harsh: 10× per minute of idle
+    # Weight of 20: meaningful but not dominant.  In real schedules
+    # most changeovers align with a batch start (gap≈0), so the
+    # penalty only fires on a handful of real gaps.  Observed: a
+    # 27-min gap costs 20*27=540 — enough for the solver to treat
+    # it as a real optimization target without inflating makespan.
+    # At weight 10, solver ignored gaps in favor of makespan.
+    # At weight 100, solver sacrificed makespan to shave idle minutes.
+    CREW_IDLE_WEIGHT = 20
     CREW_IDLE_CAP = 480    # cap at one shift — beyond this is equally bad
     crew_idle_terms: list = []
 
@@ -489,7 +497,8 @@ def solve_schedule(
                 gap_vars = []
                 for cand in candidates:
                     # abs-distance: gap >= |starts[cand] - crew_free|
-                    # Solver pushes to equality through minimization
+                    # Domain must fit any real difference (up to horizon);
+                    # the penalty is capped later via add_min_equality.
                     gap_cand = model.new_int_var(
                         0, horizon,
                         f"cidle_g_{bi.batch_id}_{cand.batch_id}"
@@ -533,7 +542,10 @@ def solve_schedule(
     # than the available workforce across concurrent batches.
 
     if cfg.total_crew > 0:
-        hc_demands = [max(1, int(round(b.dominant_headcount))) for b in batches]
+        # Use ceiling rather than round: a fractional 11.4 headcount
+        # demand still occupies 12 people on the floor, and rounding
+        # down can cause the solver to over-schedule concurrent crew.
+        hc_demands = [max(1, int(math.ceil(b.dominant_headcount))) for b in batches]
         model.add_cumulative(all_intervals, hc_demands, cfg.total_crew)
 
     # ── Objective ────────────────────────────────────────────────
@@ -630,11 +642,26 @@ def solve_schedule(
     if crew_sandwich_terms:
         sandwich_term = sum(lit * pen for lit, pen in crew_sandwich_terms)
 
-    # ── Layer 4e: Compactness — push batches to start early ────
-    # Weight of 3 per batch matches the P+ boost push-early force,
-    # ensuring batches start at the shift boundary (e.g. 06:30)
-    # rather than drifting later.
-    compact_term = 3 * sum(starts[b.batch_id] for b in batches)
+    # ── Layer 4e: Compactness — push FIRST batch per machine early ────
+    # Only the earliest batch on each machine determines shift-start
+    # alignment (06:30).  Pushing ALL batches early drowns out the
+    # crew-idle and changeover penalties since it's proportional to
+    # every batch's start time.  Instead, compute min(starts) per
+    # machine via add_min_equality — this is ~9 vars instead of ~30,
+    # and only penalizes the batches that actually matter for
+    # shift-boundary alignment.
+    first_starts: list[cp_model.IntVar] = []
+    for machine_id, m_batches in machine_batches.items():
+        if not m_batches:
+            continue
+        m_min_start = model.new_int_var(
+            0, horizon, f"first_start_{machine_id}"
+        )
+        model.add_min_equality(
+            m_min_start, [starts[b.batch_id] for b in m_batches]
+        )
+        first_starts.append(m_min_start)
+    compact_term = 3 * sum(first_starts) if first_starts else 0
 
     # ── Layer 4f: Crew-idle penalty ──────────────────────────────
     crew_idle_term = 0
@@ -664,7 +691,11 @@ def solve_schedule(
     complexity = 1 + (1 if cfg.priority_boost else 0)
     effective_limit = time_limit_seconds * complexity
     solver.parameters.max_time_in_seconds = effective_limit
-    solver.parameters.num_workers = 8
+    # Use all available CPU cores. At 12+ workers, CP-SAT activates
+    # additional sub-solver strategies (LNS, core-based, etc).
+    solver.parameters.num_workers = max(8, os.cpu_count() or 8)
+    # Log objective bound progression — useful for tuning weights.
+    solver.parameters.log_search_progress = True
 
     status = solver.solve(model)
 
