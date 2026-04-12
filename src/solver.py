@@ -87,53 +87,196 @@ def _assign_multi_machine_group(
     jobs: list[dict], machine_jobs: dict[str, list[dict]],
     minimize_changeovers: bool = False,
 ) -> None:
-    """Assign jobs to machines within a multi-eligible group, balancing total hours.
+    """Assign tool bundles to machines using CP-SAT for global optimality.
 
-    Eligible machines and changeover costs are derived from each job's
-    eligible_machines list and the machine registry.
+    Replaces the greedy largest-first heuristic.  A small CP-SAT model
+    decides which machine each tool bundle goes to, minimising a weighted
+    combination of:
+      - Makespan (max machine load across the group)
+      - Total changeover cost (each distinct tool on a machine costs one CO)
+      - Load variance (discourage extreme imbalance)
 
-    When minimize_changeovers is True, adding a new tool to a machine incurs
-    a virtual penalty equal to that machine's changeover cost, encouraging
-    consolidation of tools on fewer machines.
+    Falls back to the greedy heuristic if the solver fails.
     """
     # Group jobs by tool
     tool_jobs: dict[str, list[dict]] = {}
     for job in jobs:
         tool_jobs.setdefault(job["tool_id"], []).append(job)
 
-    # Build tool bundles: (tool_id, total_hours, jobs, eligible_machines)
-    bundles: list[tuple[str, float, list[dict], list[str]]] = []
+    # Build tool bundles: (tool_id, total_minutes, jobs, eligible_machines)
+    bundles: list[tuple[str, int, list[dict], list[str]]] = []
     for tool_id, tjobs in tool_jobs.items():
-        total_hrs = sum(j["run_hours"] for j in tjobs)
+        total_min = max(1, round(sum(j["run_hours"] for j in tjobs) * 60))
         eligible = tjobs[0]["eligible_machines"]
-        bundles.append((tool_id, total_hrs, tjobs, eligible))
+        bundles.append((tool_id, total_min, tjobs, eligible))
 
-    # Sort largest first for better load balance
-    bundles.sort(key=lambda b: -b[1])
+    if not bundles:
+        return
 
     # Derive the full set of machines this group can use
-    all_machines: set[str] = set()
-    for _, _, _, eligible in bundles:
-        all_machines.update(eligible)
+    all_machines: list[str] = sorted({m for _, _, _, elig in bundles for m in elig})
 
-    # Track load and tool count per machine
-    load: dict[str, float] = {}
-    tools_on: dict[str, int] = {}
+    # Existing load on each machine (from single-eligible jobs already placed)
+    existing_load: dict[str, int] = {}
+    existing_tools: dict[str, set[str]] = {}
     for mid in all_machines:
-        load[mid] = sum(j["run_hours"] for j in machine_jobs[mid])
-        tools_on[mid] = len(set(j["tool_id"] for j in machine_jobs[mid]))
+        existing_load[mid] = max(1, round(
+            sum(j["run_hours"] for j in machine_jobs[mid]) * 60
+        )) if machine_jobs[mid] else 0
+        existing_tools[mid] = {j["tool_id"] for j in machine_jobs[mid]}
 
-    for tool_id, total_hrs, tjobs, eligible in bundles:
-        if minimize_changeovers:
-            best = min(eligible, key=lambda m: (
-                load[m] + MACHINE_BY_ID[m].changeover_hours * tools_on[m]
-            ))
+    n_bundles = len(bundles)
+    n_machines = len(all_machines)
+
+    # ── CP-SAT model ────────────────────────────────────────────
+    model = cp_model.CpModel()
+
+    # Eligible machine indices per bundle (precompute for constraints)
+    eligible_indices: list[list[int]] = []
+    for t in range(n_bundles):
+        eligible_set = set(bundles[t][3])
+        eligible_indices.append([m for m in range(n_machines)
+                                 if all_machines[m] in eligible_set])
+
+    # x[t][m] = 1 if tool bundle t is assigned to machine m
+    x: list[list[cp_model.IntVar]] = []
+    for t in range(n_bundles):
+        row = []
+        elig = set(eligible_indices[t])
+        for m in range(n_machines):
+            if m in elig:
+                row.append(model.new_bool_var(f"x_{t}_{all_machines[m]}"))
+            else:
+                v = model.new_int_var(0, 0, f"x_{t}_{all_machines[m]}_0")
+                row.append(v)
+        x.append(row)
+
+    # Exactly one machine per tool bundle
+    for t in range(n_bundles):
+        model.add_exactly_one(x[t][m] for m in eligible_indices[t])
+
+    # ── Effective machine loads (work + changeover time) ──────────
+    #
+    # The schedule length on a machine = work hours + changeover hours.
+    # A changeover is triggered each time a NEW tool appears on a
+    # machine (not already loaded from single-eligible jobs).
+    # new_tool[t][m] is a bool: 1 if bundle t assigned to machine m
+    # and the tool wasn't pre-loaded.
+    #
+    # effective_load[m] = existing_load + work_from_bundles
+    #                     + n_new_tools * changeover_minutes
+
+    # Upper bound: all work + all possible changeovers on one machine
+    max_co_per_machine = max(
+        round(MACHINE_BY_ID[mid].changeover_hours * 60) for mid in all_machines
+    )
+    max_possible_load = (
+        sum(b[1] for b in bundles)
+        + max(existing_load.values(), default=0)
+        + n_bundles * max_co_per_machine
+    )
+
+    effective_loads: list[cp_model.IntVar] = []
+    per_machine_co: list[cp_model.LinearExpr] = []
+
+    for m, mid in enumerate(all_machines):
+        co_min = round(MACHINE_BY_ID[mid].changeover_hours * 60)
+
+        # Work from assigned bundles
+        bundle_work = sum(
+            bundles[t][1] * x[t][m] for t in range(n_bundles)
+        )
+
+        # Changeover cost: one CO per new tool on this machine
+        if co_min > 0:
+            co_terms = []
+            for t in range(n_bundles):
+                tool_id = bundles[t][0]
+                if tool_id in existing_tools[mid]:
+                    continue  # tool already loaded — no changeover
+                co_terms.append(x[t][m])
+            # n_new_tools for this machine (integer var)
+            n_new = model.new_int_var(0, n_bundles, f"n_new_{mid}")
+            model.add(n_new == sum(co_terms) if co_terms else 0)
+            machine_co = n_new * co_min
         else:
-            best = min(eligible, key=lambda m: load[m])
+            machine_co = 0
+            n_new = model.new_int_var(0, 0, f"n_new_{mid}")
+
+        per_machine_co.append(machine_co)
+
+        eff = model.new_int_var(0, max_possible_load, f"eff_load_{mid}")
+        model.add(eff == existing_load[mid] + bundle_work + machine_co)
+        effective_loads.append(eff)
+
+    # Makespan = max effective load (work + changeovers) across machines
+    makespan = model.new_int_var(0, max_possible_load, "assign_makespan")
+    model.add_max_equality(makespan, effective_loads)
+
+    # Total changeover cost across all machines
+    total_co = sum(per_machine_co)
+
+    # ── Load balance penalty ───────────────────────────────────
+    # Penalize max-min effective load range.
+    min_load = model.new_int_var(0, max_possible_load, "min_load")
+    model.add_min_equality(min_load, effective_loads)
+    load_range = model.new_int_var(0, max_possible_load, "load_range")
+    model.add(load_range == makespan - min_load)
+
+    # ── Objective ───────────────────────────────────────────────
+    # Minimize effective makespan.  The makespan already includes
+    # changeover time, so total_co adds a secondary penalty for
+    # total changeover volume (prefer fewer COs even if makespan
+    # is tied).  Load range encourages balance.
+    model.minimize(2 * makespan + total_co + load_range)
+
+    # ── Solve ───────────────────────────────────────────────────
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 5.0  # tiny model, 5s is generous
+    solver.parameters.num_workers = min(4, os.cpu_count() or 4)
+    status = solver.solve(model)
+
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        # Fallback to greedy
+        _assign_multi_machine_group_greedy(
+            jobs, machine_jobs, bundles, all_machines, existing_load
+        )
+        return
+
+    # ── Apply solution ──────────────────────────────────────────
+    for t, (tool_id, total_min, tjobs, eligible) in enumerate(bundles):
+        for m, mid in enumerate(all_machines):
+            if solver.value(x[t][m]):
+                for job in tjobs:
+                    job["assigned_machine"] = mid
+                    machine_jobs[mid].append(job)
+                break
+
+
+def _assign_multi_machine_group_greedy(
+    jobs: list[dict],
+    machine_jobs: dict[str, list[dict]],
+    bundles: list[tuple[str, int, list[dict], list[str]]],
+    all_machines: list[str],
+    existing_load: dict[str, int],
+) -> None:
+    """Greedy fallback: largest-first, minimise load + changeover proxy."""
+    # Sort largest first
+    sorted_bundles = sorted(bundles, key=lambda b: -b[1])
+
+    load = dict(existing_load)
+    tools_on: dict[str, int] = {mid: 0 for mid in all_machines}
+    for mid in all_machines:
+        tools_on[mid] = len({j["tool_id"] for j in machine_jobs[mid]})
+
+    for tool_id, total_min, tjobs, eligible in sorted_bundles:
+        best = min(eligible, key=lambda m: (
+            load[m] + round(MACHINE_BY_ID[m].changeover_hours * 60) * tools_on[m]
+        ))
         for job in tjobs:
             job["assigned_machine"] = best
             machine_jobs[best].append(job)
-        load[best] += total_hrs
+        load[best] += total_min
         tools_on[best] += 1
 
 

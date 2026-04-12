@@ -681,75 +681,24 @@ def _apply_assignments(
     return movements
 
 
-def _score_assignment(
-    assignments: list[int],
-    freed_events: list[tuple],
-    job_starts: list[ScheduleEntry],
-    feasible: list[list[int]],
-) -> tuple[float, float, float]:
-    """Score an assignment vector on three objectives (all minimize).
 
-    Returns (idle_time, ping_pong_count, hc_mismatch).
-    """
-    total_idle = 0.0
-    total_hc_mismatch = 0.0
-    ping_pongs = 0
-
-    # Track flows for ping-pong detection
-    # forced=True when the freed event has only one feasible target
-    flows: list[tuple[str, str, datetime, bool]] = []  # (from, to, time, forced)
-
-    for i, target_idx in enumerate(assignments):
-        if target_idx < 0:
-            # Unassigned freed crew = wasted idle
-            total_idle += 3600.0  # 1-hour penalty for unassigned
-            continue
-
-        freed_time, freed_machine, hc, reason, source_entry = freed_events[i]
-        target = job_starts[target_idx]
-
-        # Idle time: gap between freed and target start
-        idle_sec = abs((target.start - freed_time).total_seconds())
-        total_idle += idle_sec
-
-        # HC mismatch
-        target_hc = target.headcount or hc
-        total_hc_mismatch += abs(hc - target_hc)
-
-        forced = len(feasible[i]) <= 1
-        flows.append((freed_machine, target.machine_id, freed_time, forced))
-
-    # Count ping-pongs: A→B followed by B→A within 2 hours
-    # Skip if either leg is a forced assignment (only one feasible target)
-    for i, (f1, t1, time1, forced1) in enumerate(flows):
-        for f2, t2, time2, forced2 in flows[i + 1:]:
-            if (f1 == t2 and t1 == f2
-                    and not forced1 and not forced2
-                    and abs((time2 - time1).total_seconds()) < 7200):
-                ping_pongs += 1
-
-    return total_idle, float(ping_pongs), total_hc_mismatch
-
-
-def _optimize_crew_pymoo(
+def _optimize_crew_cpsat(
     freed_events: list[tuple],
     job_starts: list[ScheduleEntry],
     feasible: list[list[int]],
 ) -> list[int]:
-    """Use pymoo NSGA-II to find Pareto-optimal crew assignments.
+    """Use CP-SAT to find optimal crew assignments.
 
-    Falls back to greedy if pymoo fails or problem is trivial.
+    Exact solver replacing the approximate NSGA-II approach.  The model
+    is tiny (~90 booleans for a typical schedule) and solves in ms.
+
+    Objective (scalarized, priority order):
+      1. Minimize ping-pong movements (A→B then B→A within 2h)
+      2. Minimize total idle time (gap between freed time and target start)
+      3. Minimize HC mismatch
+      4. Maximize total assignments (prefer matching over leaving idle)
     """
-    try:
-        import numpy as np
-        from pymoo.algorithms.moo.nsga2 import NSGA2
-        from pymoo.core.problem import Problem
-        from pymoo.core.sampling import Sampling
-        from pymoo.core.crossover import Crossover
-        from pymoo.core.mutation import Mutation
-        from pymoo.optimize import minimize as pymoo_minimize
-    except ImportError:
-        return _greedy_assignment(freed_events, job_starts, feasible)
+    from ortools.sat.python import cp_model as crew_cp
 
     n_sources = len(freed_events)
     n_targets = len(job_starts)
@@ -757,113 +706,104 @@ def _optimize_crew_pymoo(
     if n_sources == 0 or n_targets == 0:
         return [-1] * n_sources
 
-    # ── Custom operators for integer assignment vectors ──────────
+    model = crew_cp.CpModel()
 
-    class CrewSampling(Sampling):
-        def _do(self, problem, n_samples, **kwargs):
-            X = np.full((n_samples, n_sources), -1, dtype=int)
-            for s in range(n_samples):
-                used_targets = set()
-                order = list(range(n_sources))
-                np.random.shuffle(order)
-                for i in order:
-                    candidates = [t for t in feasible[i] if t not in used_targets]
-                    if candidates:
-                        t = candidates[np.random.randint(len(candidates))]
-                        X[s, i] = t
-                        used_targets.add(t)
-            return X
+    # x[i][j] = 1 if freed event i assigned to job start j
+    x: dict[tuple[int, int], crew_cp.IntVar] = {}
+    source_vars: dict[int, list[crew_cp.IntVar]] = {}
+    target_vars: dict[int, list[crew_cp.IntVar]] = {}
 
-    class CrewCrossover(Crossover):
-        def __init__(self):
-            super().__init__(n_parents=2, n_offsprings=2)
+    for i in range(n_sources):
+        source_vars[i] = []
+        for j in feasible[i]:
+            v = model.new_bool_var(f"c_{i}_{j}")
+            x[(i, j)] = v
+            source_vars[i].append(v)
+            target_vars.setdefault(j, []).append(v)
 
-        def _do(self, problem, X, **kwargs):
-            n_matings = X.shape[0]
-            Y = np.full((n_matings, 2, n_sources), -1, dtype=int)
-            for k in range(n_matings):
-                p1, p2 = X[k, 0], X[k, 1]
-                # Uniform crossover with feasibility repair
-                for off in range(2):
-                    child = np.full(n_sources, -1, dtype=int)
-                    used = set()
-                    order = list(range(n_sources))
-                    np.random.shuffle(order)
-                    for i in order:
-                        parent_val = p1[i] if (np.random.random() < 0.5) else p2[i]
-                        if parent_val >= 0 and parent_val in feasible[i] and parent_val not in used:
-                            child[i] = parent_val
-                            used.add(parent_val)
-                        else:
-                            candidates = [t for t in feasible[i] if t not in used]
-                            if candidates:
-                                child[i] = candidates[np.random.randint(len(candidates))]
-                                used.add(child[i])
-                    Y[k, off] = child
-            return Y
+    # At most one target per freed event
+    for i in range(n_sources):
+        if source_vars[i]:
+            model.add(sum(source_vars[i]) <= 1)
 
-    class CrewMutation(Mutation):
-        def _do(self, problem, X, **kwargs):
-            for i in range(X.shape[0]):
-                if np.random.random() < 0.3:
-                    # Pick a random source and reassign it
-                    src = np.random.randint(n_sources)
-                    used = set(X[i]) - {-1, X[i, src]}
-                    candidates = [t for t in feasible[src] if t not in used]
-                    if candidates:
-                        X[i, src] = candidates[np.random.randint(len(candidates))]
-                    else:
-                        X[i, src] = -1
-            return X
+    # At most one source per job start
+    for j, tvars in target_vars.items():
+        if tvars:
+            model.add(sum(tvars) <= 1)
 
-    class CrewProblem(Problem):
-        def __init__(self):
-            super().__init__(
-                n_var=n_sources,
-                n_obj=3,
-                xl=-1,
-                xu=n_targets - 1,
-            )
+    # ── Ping-pong constraints ───────────────────────────────────
+    PING_PONG_PENALTY = 10000
+    pp_terms: list = []
 
-        def _evaluate(self, X, out, *args, **kwargs):
-            F = np.zeros((X.shape[0], 3))
-            for k in range(X.shape[0]):
-                assignments = X[k].astype(int).tolist()
-                F[k] = _score_assignment(
-                    assignments, freed_events, job_starts, feasible
-                )
-            out["F"] = F
+    for i1 in range(n_sources):
+        if len(feasible[i1]) <= 1:
+            continue
+        ft1, fm1, _, _, _ = freed_events[i1]
+        for i2 in range(i1 + 1, n_sources):
+            if len(feasible[i2]) <= 1:
+                continue
+            ft2, fm2, _, _, _ = freed_events[i2]
+            if abs((ft2 - ft1).total_seconds()) >= 7200:
+                continue
+            for j1 in feasible[i1]:
+                t1_mid = job_starts[j1].machine_id
+                for j2 in feasible[i2]:
+                    t2_mid = job_starts[j2].machine_id
+                    if fm1 == t2_mid and t1_mid == fm2:
+                        pp = model.new_bool_var(f"pp_{i1}_{j1}_{i2}_{j2}")
+                        model.add(x[(i1, j1)] + x[(i2, j2)] == 2).only_enforce_if(pp)
+                        model.add(x[(i1, j1)] + x[(i2, j2)] < 2).only_enforce_if(~pp)
+                        pp_terms.append(pp)
 
-    algorithm = NSGA2(
-        pop_size=50,
-        sampling=CrewSampling(),
-        crossover=CrewCrossover(),
-        mutation=CrewMutation(),
-        eliminate_duplicates=True,
-    )
+    # ── Idle time cost (minutes) ────────────────────────────────
+    idle_terms: list = []
+    for i in range(n_sources):
+        ft = freed_events[i][0]
+        for j in feasible[i]:
+            idle_min = round(abs((job_starts[j].start - ft).total_seconds()) / 60.0)
+            if idle_min > 0:
+                idle_terms.append(idle_min * x[(i, j)])
 
-    result = pymoo_minimize(
-        CrewProblem(),
-        algorithm,
-        termination=("n_gen", 80),
-        seed=42,
-        verbose=False,
-    )
+    # ── HC mismatch cost ────────────────────────────────────────
+    hc_terms: list = []
+    for i in range(n_sources):
+        hc = freed_events[i][2]
+        for j in feasible[i]:
+            target_hc = job_starts[j].headcount or hc
+            hc_diff = round(abs(hc - target_hc))
+            if hc_diff > 0:
+                hc_terms.append(hc_diff * x[(i, j)])
 
-    if result.X is None:
+    # ── Unassigned penalty ──────────────────────────────────────
+    UNASSIGNED_PENALTY = 60
+    total_assigned = sum(v for vl in source_vars.values() for v in vl)
+
+    # ── Objective ───────────────────────────────────────────────
+    obj = UNASSIGNED_PENALTY * (n_sources - total_assigned)
+    if pp_terms:
+        obj += PING_PONG_PENALTY * sum(pp_terms)
+    if idle_terms:
+        obj += sum(idle_terms)
+    if hc_terms:
+        obj += sum(hc_terms)
+    model.minimize(obj)
+
+    # ── Solve ───────────────────────────────────────────────────
+    solver = crew_cp.CpSolver()
+    solver.parameters.max_time_in_seconds = 2.0
+    solver.parameters.num_workers = 2
+    status = solver.solve(model)
+
+    if status not in (crew_cp.OPTIMAL, crew_cp.FEASIBLE):
         return _greedy_assignment(freed_events, job_starts, feasible)
 
-    # Pick solution with lowest ping-pong count, then lowest idle time
-    F = result.F
-    best_idx = 0
-    best_key = (F[0, 1], F[0, 0], F[0, 2])  # (ping_pong, idle, hc_mismatch)
-    for k in range(1, F.shape[0]):
-        key = (F[k, 1], F[k, 0], F[k, 2])
-        if key < best_key:
-            best_key = key
-            best_idx = k
-
-    return result.X[best_idx].astype(int).tolist()
+    assignments = [-1] * n_sources
+    for i in range(n_sources):
+        for j in feasible[i]:
+            if solver.value(x[(i, j)]):
+                assignments[i] = j
+                break
+    return assignments
 
 
 def _greedy_assignment(
@@ -925,9 +865,9 @@ def _compute_crew_movements(
 ) -> list[CrewMovement]:
     """Optimized crew movement assignment.
 
-    Uses pymoo NSGA-II multi-objective optimizer to find crew assignments
-    that minimize idle time, ping-pong movements, and HC mismatch.
-    Falls back to greedy assignment if pymoo is unavailable.
+    Uses CP-SAT to find exact-optimal crew assignments that minimize
+    idle time, ping-pong movements, and HC mismatch.
+    Falls back to greedy assignment if the solver fails.
     """
     freed_events, job_starts = _collect_crew_events(entries, cfg)
 
@@ -936,9 +876,8 @@ def _compute_crew_movements(
 
     feasible = _build_feasible_pairings(freed_events, job_starts)
 
-    # Try pymoo optimizer, fall back to greedy
     try:
-        assignments = _optimize_crew_pymoo(freed_events, job_starts, feasible)
+        assignments = _optimize_crew_cpsat(freed_events, job_starts, feasible)
     except Exception:
         assignments = _greedy_assignment(freed_events, job_starts, feasible)
 
