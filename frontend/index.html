@@ -535,6 +535,9 @@ async function runSchedule() {
     formData.append('machine_groups', JSON.stringify(groups));
   }
 
+  // Capture solve start time so we can poll for new runs if connection drops
+  const solveStartedAt = new Date().toISOString();
+
   try {
     const resp = await fetch('/api/schedule', { method: 'POST', body: formData });
     scheduleData = await resp.json();
@@ -544,10 +547,41 @@ async function runSchedule() {
     barBg.style.display = 'none';
     onScheduleLoaded();
   } catch (err) {
-    clearInterval(timerIv);
-    document.getElementById('loading').classList.remove('show');
-    barBg.style.display = 'none';
-    alert('Error: ' + err.message);
+    // Connection dropped (proxy timeout, network error, etc.)
+    // The backend may still be running — poll for the result in scheduler_runs
+    timerEl.textContent = 'Connection lost — waiting for server to finish...';
+    barFill.style.width = '100%';
+    barFill.style.background = 'var(--orange)';
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const pollResp = await fetch('/api/runs');
+        if (!pollResp.ok) return;
+        const pollData = await pollResp.json();
+        const runs = pollData.runs || [];
+        // Find a run created after we started the solve
+        const newRun = runs.find(r => r.created_at > solveStartedAt);
+        if (newRun) {
+          clearInterval(pollInterval);
+          clearInterval(timerIv);
+          timerEl.textContent = 'Found completed run — loading...';
+          await loadRunIntoUI(newRun.run_id);
+          document.getElementById('loading').classList.remove('show');
+          barBg.style.display = 'none';
+          barFill.style.background = 'var(--accent)';
+        }
+      } catch (_) { /* server still busy, keep polling */ }
+    }, 10000); // poll every 10 seconds
+
+    // Give up polling after 20 minutes total
+    setTimeout(() => {
+      clearInterval(pollInterval);
+      clearInterval(timerIv);
+      document.getElementById('loading').classList.remove('show');
+      barBg.style.display = 'none';
+      barFill.style.background = 'var(--accent)';
+      alert('The schedule is still generating. Check Database → scheduler_runs to load the result once it completes.');
+    }, 1200000);
   }
 }
 
