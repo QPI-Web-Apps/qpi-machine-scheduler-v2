@@ -617,10 +617,24 @@ def solve_schedule(
     CREW_IDLE_CAP = 480    # cap at one shift — beyond this is equally bad
     crew_idle_terms: list = []
 
-    # Pre-build other-machine batch lists
+    # Pre-build other-machine batch lists — only machines that
+    # realistically exchange crew.  Maintenance machines (16A/B/C, 8,
+    # 6ST, RF) share crew with each other and with Machine 20 (which
+    # receives crew but never sends).  Self-service machines (LMB, SMB)
+    # have their own crew and never participate in maintenance crew
+    # flow, so including them as candidates just inflates the model
+    # with ~1,000+ variables that can never improve the solution.
+    crew_exchange_machines: set[str] = set()
+    for mid, spec in MACHINE_BY_ID.items():
+        if not spec.self_service_changeover:
+            crew_exchange_machines.add(mid)
+
     other_batches_for: dict[str, list[ToolBatch]] = {}
     for mid in machine_batches:
-        other_batches_for[mid] = [b for b in batches if b.machine_id != mid]
+        other_batches_for[mid] = [
+            b for b in batches
+            if b.machine_id != mid and b.machine_id in crew_exchange_machines
+        ]
 
     # Shared cap constant for capping penalties
     cap_const = model.new_int_var(CREW_IDLE_CAP, CREW_IDLE_CAP, "cidle_cap")
@@ -868,10 +882,14 @@ def solve_schedule(
     # ── Solve ───────────────────────────────────────────────────
 
     solver = cp_model.CpSolver()
-    # More objective terms → harder problem → more time
-    complexity = 1 + (1 if cfg.priority_boost else 0)
-    effective_limit = time_limit_seconds * complexity
+    # P+ Boost needs more time — priority terms make convergence slower
+    effective_limit = time_limit_seconds + (300 if cfg.priority_boost else 0)
     solver.parameters.max_time_in_seconds = effective_limit
+    # Stop early when the solution is within 5% of the proven lower
+    # bound.  Most runs find a near-optimal solution in 30-60s and
+    # then spend 140+s squeezing out <2% improvement.  This lets the
+    # solver stop as soon as the gap is small enough.
+    solver.parameters.relative_gap_limit = 0.05
     # Use all available CPU cores. At 12+ workers, CP-SAT activates
     # additional sub-solver strategies (LNS, core-based, etc).
     solver.parameters.num_workers = min(15, os.cpu_count() or 8)
