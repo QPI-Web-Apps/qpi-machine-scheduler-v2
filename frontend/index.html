@@ -117,6 +117,7 @@
 
 <div class="tabs" id="tabsBar" style="display:none;">
   <div class="tab active" data-tab="gantt">Day View</div>
+  <div class="tab" data-tab="weekview">Week View</div>
   <div class="tab" data-tab="machines">Machines</div>
   <div class="tab" data-tab="crew">Crew Movements</div>
   <div class="tab" data-tab="headcount">Headcount</div>
@@ -163,6 +164,11 @@
     </div>
     <div id="dayGantt"></div>
     <div class="day-summary" id="daySummary"></div>
+  </div>
+
+  <!-- Week View Tab -->
+  <div class="tab-panel" id="panel-weekview" style="display:none;">
+    <div id="weekViewContent"></div>
   </div>
 
   <!-- Machines Tab -->
@@ -612,6 +618,7 @@ let dbState = {
   rows: [],              // current rows for activeTable
   columns: [],           // current columns
   selected: new Set(),   // selected row ids
+  runs: [],              // scheduler_runs from /api/runs
 };
 
 function toggleDbPanel() {
@@ -625,15 +632,25 @@ async function loadDbTables() {
   const tabsEl = document.getElementById('dbTabs');
   tabsEl.innerHTML = '<div class="db-loading">Loading tables…</div>';
   try {
-    const resp = await fetch('/api/db/tables');
-    const body = await resp.json();
-    if (!resp.ok) throw new Error(body.error || 'failed to list tables');
-    dbState.tables = body.tables;
+    const [tablesResp, runsResp] = await Promise.all([
+      fetch('/api/db/tables'),
+      fetch('/api/runs'),
+    ]);
+    const tablesBody = await tablesResp.json();
+    if (!tablesResp.ok) throw new Error(tablesBody.error || 'failed to list tables');
+    dbState.tables = tablesBody.tables;
+
+    if (runsResp.ok) {
+      const runsBody = await runsResp.json();
+      dbState.runs = runsBody.runs || [];
+      dbState.tables.push({ name: 'scheduler_runs', total: dbState.runs.length });
+    }
+
     renderDbTabs();
     if (!dbState.activeTable && dbState.tables.length) {
       selectDbTable(dbState.tables[0].name);
     } else if (dbState.activeTable) {
-      await loadDbRows();
+      selectDbTable(dbState.activeTable);
     }
   } catch (err) {
     tabsEl.innerHTML = '<div class="db-error">Error: ' + err.message + '</div>';
@@ -655,8 +672,13 @@ function selectDbTable(name) {
   dbState.activeTable = name;
   dbState.selected.clear();
   renderDbTabs();
-  document.getElementById('dbToolbar').style.display = 'flex';
-  loadDbRows();
+  if (name === 'scheduler_runs') {
+    document.getElementById('dbToolbar').style.display = 'none';
+    renderRunsTable();
+  } else {
+    document.getElementById('dbToolbar').style.display = 'flex';
+    loadDbRows();
+  }
 }
 
 async function loadDbRows() {
@@ -767,6 +789,92 @@ async function postDbDelete(payload) {
   }
 }
 
+// ── Scheduler Runs tab ───────────────────────────────
+function renderRunsTable() {
+  const wrap = document.getElementById('dbTableWrap');
+  if (!dbState.runs.length) {
+    wrap.innerHTML = '<div class="db-empty">No runs found.</div>';
+    return;
+  }
+
+  const fmtDate = (v) => {
+    if (!v) return '-';
+    try { return new Date(v).toLocaleString(); } catch (_) { return v; }
+  };
+
+  let html = '<div class="db-scroll"><table class="data-table db-table"><thead><tr>';
+  html += '<th>Run ID</th><th>Date</th><th>Status</th><th>Jobs</th><th>Makespan</th><th>Crew Moves</th><th>Note</th><th></th>';
+  html += '</tr></thead><tbody>';
+
+  dbState.runs.forEach(r => {
+    const statusColor = r.solver_status === 'OPTIMAL' ? 'var(--green)' : r.solver_status === 'FEASIBLE' ? 'var(--blue)' : 'var(--red)';
+    html += '<tr>';
+    html += `<td><code style="font-size:0.85em;background:var(--surface2);padding:2px 6px;border-radius:4px;">${r.run_id}</code></td>`;
+    html += `<td>${fmtDate(r.created_at)}</td>`;
+    html += `<td style="color:${statusColor};font-weight:600;">${r.solver_status}</td>`;
+    html += `<td>${r.total_jobs}</td>`;
+    html += `<td>${r.makespan_hours}h</td>`;
+    html += `<td>${r.crew_movements}</td>`;
+    html += `<td>${r.note || ''}</td>`;
+    html += `<td><button class="day-btn" onclick="loadRunIntoUI('${r.run_id}')" style="padding:4px 12px;font-size:0.8rem;">Load</button></td>`;
+    html += '</tr>';
+  });
+
+  html += '</tbody></table></div>';
+  document.getElementById('dbCount').textContent = `${dbState.runs.length} runs`;
+  wrap.innerHTML = html;
+}
+
+async function loadRunIntoUI(runId) {
+  const wrap = document.getElementById('dbTableWrap');
+  wrap.innerHTML = '<div class="db-loading">Loading run ' + runId + '…</div>';
+  try {
+    const resp = await fetch('/api/runs/' + runId);
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'failed to load run');
+
+    // Build scheduleData from the run's result JSON
+    const result = data.result || {};
+    scheduleData = {
+      schedule_id: data.run_id,
+      solver_status: data.solver_status,
+      total_jobs: data.total_jobs,
+      makespan_hours: data.makespan_hours,
+      skipped_count: data.skipped_count,
+      total_entries: (result.schedule || []).length,
+      schedule: result.schedule || [],
+      machines: result.machines || {},
+      crew_movements: result.crew_movements || [],
+      skipped_jobs: result.skipped_jobs || [],
+      groups: result.groups || null,
+      germantown_jobs: result.germantown_jobs || [],
+    };
+
+    // Map config fields for restoreConfig
+    const cfg = data.config || {};
+    const startParts = (cfg.schedule_start || '').split('T');
+    const mappedConfig = {
+      reference_date: startParts[0] || '',
+      reference_time: startParts[1] ? startParts[1].substring(0, 5) : '06:30',
+      max_concurrent: cfg.max_concurrent || 5,
+      include_yellow: cfg.include_yellow || false,
+      include_pink: cfg.include_pink || false,
+      include_white: cfg.include_white || false,
+      priority_boost: cfg.priority_boost || false,
+      shift_config: cfg.shift_schedule || {},
+      initial_tools: cfg.initial_tools || {},
+    };
+    restoreConfig(mappedConfig);
+
+    // Close DB panel and render
+    document.getElementById('dbPanel').classList.add('collapsed');
+    document.getElementById('emptyState').style.display = 'none';
+    onScheduleLoaded();
+  } catch (err) {
+    wrap.innerHTML = '<div class="db-error">Error: ' + err.message + '</div>';
+  }
+}
+
 document.getElementById('jsonFileInput').addEventListener('change', (e) => {
   const file = e.target.files[0];
   if (!file) return;
@@ -856,6 +964,7 @@ function onScheduleLoaded() {
   computeDays();
   currentDayIndex = 0;
   renderDay();
+  renderWeekView();
   renderMachineTable();
   renderCrewMovements();
   renderHeadcount();
@@ -1153,6 +1262,143 @@ function renderDaySummary(dayEntries, dayStartMs, dayEndMs) {
 
 function card(label, value) {
   return `<div class="day-summary-card"><div class="ds-label">${label}</div><div class="ds-value">${value}</div></div>`;
+}
+
+// ── Week View Rendering ──────────────────────────────
+function renderWeekView() {
+  if (!scheduleData || !scheduleDays.length) {
+    document.getElementById('weekViewContent').innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-dim);">No schedule data</div>';
+    return;
+  }
+
+  const totalHours = 16; // 06:30–22:30 (no S3 in week overview)
+  const rowH = 28; // compact row height
+  let html = '';
+
+  // Legend
+  html += '<div style="display:flex;gap:16px;align-items:center;margin-bottom:16px;flex-wrap:wrap;">';
+  html += '<div class="legend">';
+  html += '<div class="legend-item"><div class="legend-swatch" style="background:var(--blue)"></div>Job</div>';
+  html += '<div class="legend-item"><div class="legend-swatch" style="background:var(--red)"></div>P+</div>';
+  html += '<div class="legend-item"><div class="legend-swatch" style="background:var(--pink)"></div>Priority</div>';
+  html += '<div class="legend-item"><div class="legend-swatch" style="background:var(--orange)"></div>Changeover</div>';
+  html += '<div class="legend-item"><div class="legend-swatch" style="background:var(--purple)"></div>Tool Swap</div>';
+  html += '<div class="legend-item"><div class="legend-swatch" style="background:var(--surface2);border:1px dashed var(--border)"></div>Idle</div>';
+  html += '</div></div>';
+
+  scheduleDays.forEach((day, dayIdx) => {
+    const dayStr = day.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+    const dayStart = new Date(day); dayStart.setHours(6, 30, 0, 0);
+    const dayEnd = new Date(day); dayEnd.setHours(22, 30, 0, 0);
+    const dayStartMs = dayStart.getTime();
+    const dayEndMs = dayEnd.getTime();
+
+    // Filter entries for this day
+    const dayEntries = scheduleData.schedule.filter(e => {
+      const es = new Date(e.start).getTime();
+      const ee = new Date(e.end).getTime();
+      return es < dayEndMs && ee > dayStartMs;
+    });
+
+    // Day stats
+    const jobs = dayEntries.filter(e => e.type === 'JOB');
+    const clamp = (e) => {
+      const s = Math.max(new Date(e.start).getTime(), dayStartMs);
+      const en = Math.min(new Date(e.end).getTime(), dayEndMs);
+      return Math.max(0, (en - s) / 3600000);
+    };
+    const jobHrs = jobs.reduce((sum, e) => sum + clamp(e), 0);
+    const coHrs = dayEntries.filter(e => e.type === 'CHANGEOVER' || e.type === 'TOOL_SWAP').reduce((sum, e) => sum + clamp(e), 0);
+    const activeMachines = new Set(dayEntries.map(e => e.machine_id)).size;
+    const dayDateStr = localDateStr(day);
+    const dayCrew = scheduleData.crew_movements.filter(cm => cm.time.startsWith(dayDateStr));
+
+    // Group by machine
+    const byMachine = {};
+    dayEntries.forEach(e => {
+      if (!byMachine[e.machine_id]) byMachine[e.machine_id] = [];
+      byMachine[e.machine_id].push(e);
+    });
+    const machines = MACHINE_ORDER.filter(m => byMachine[m]);
+
+    // Day card
+    html += `<div class="week-day-card" style="margin-bottom:20px;background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;">`;
+
+    // Day header with stats
+    html += `<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 16px;background:var(--header-bg);color:var(--header-text);cursor:pointer;" onclick="currentDayIndex=${dayIdx};document.querySelector('[data-tab=gantt]').click();renderDay();">`;
+    html += `<div style="font-weight:600;font-size:1rem;">${dayStr}</div>`;
+    html += `<div style="display:flex;gap:16px;font-size:0.8rem;opacity:0.85;">`;
+    html += `<span>${activeMachines} machines</span>`;
+    html += `<span>${jobs.length} jobs</span>`;
+    html += `<span>${jobHrs.toFixed(1)}h work</span>`;
+    html += `<span>${coHrs.toFixed(1)}h CO</span>`;
+    html += `<span>${dayCrew.length} crew moves</span>`;
+    html += `</div></div>`;
+
+    if (machines.length === 0) {
+      html += '<div style="padding:20px;text-align:center;color:var(--text-dim);font-size:0.85rem;">No activity</div>';
+    } else {
+      html += '<div style="padding:8px 0;">';
+
+      // Time ruler (compact)
+      html += '<div style="display:flex;height:16px;font-size:10px;color:var(--text-dim);">';
+      html += '<div style="min-width:44px;"></div>';
+      html += '<div style="flex:1;position:relative;">';
+      for (let h = 7; h <= 22; h++) {
+        const pct = ((h - SHIFT1_START_H) / totalHours) * 100;
+        if (pct >= 0 && pct <= 100) {
+          html += `<span style="position:absolute;left:${pct}%;transform:translateX(-50%);font-variant-numeric:tabular-nums;">${h}</span>`;
+        }
+      }
+      html += '</div></div>';
+
+      // Machine rows (compact)
+      machines.forEach(mid => {
+        html += `<div style="display:flex;height:${rowH}px;align-items:center;border-top:1px solid var(--border-light);">`;
+        html += `<div style="min-width:44px;font-size:11px;font-weight:600;color:var(--text-dim);padding-left:8px;">${mid}</div>`;
+        html += '<div style="flex:1;position:relative;height:20px;background:var(--surface2);border-radius:3px;margin-right:8px;">';
+
+        // Shift divider at 14:30
+        const div1Pct = ((SHIFT1_END_H - SHIFT1_START_H) / totalHours) * 100;
+        html += `<div style="position:absolute;left:${div1Pct}%;top:0;bottom:0;width:1px;background:var(--border);z-index:1;"></div>`;
+
+        // Bars
+        (byMachine[mid] || []).forEach(e => {
+          const es = Math.max(new Date(e.start).getTime(), dayStartMs);
+          const ee = Math.min(new Date(e.end).getTime(), dayEndMs);
+          if (ee <= es) return;
+
+          const leftPct = ((es - dayStartMs) / (dayEndMs - dayStartMs)) * 100;
+          const widthPct = ((ee - es) / (dayEndMs - dayStartMs)) * 100;
+
+          let bg = 'var(--surface2)';
+          let border = '1px dashed var(--border)';
+          if (e.type === 'JOB') {
+            if (e.priority_class <= 0) { bg = 'var(--red)'; border = 'none'; }
+            else if (e.priority_class <= 2) { bg = 'var(--pink)'; border = 'none'; }
+            else { bg = 'var(--blue)'; border = 'none'; }
+          } else if (e.type === 'CHANGEOVER') { bg = 'var(--orange)'; border = 'none'; }
+          else if (e.type === 'TOOL_SWAP') { bg = 'var(--purple)'; border = 'none'; }
+
+          const dataAttr = `data-entry='${JSON.stringify(e).replace(/'/g, "&#39;")}'`;
+          html += `<div style="position:absolute;left:${leftPct}%;width:${widthPct}%;top:1px;bottom:1px;background:${bg};border:${border};border-radius:2px;overflow:hidden;" ${dataAttr} onmouseenter="showTooltip(event)" onmouseleave="hideTooltip()">`;
+          if (widthPct > 6 && e.type === 'JOB') {
+            html += `<span style="font-size:9px;color:#fff;padding:0 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;line-height:18px;">${e.so_number || ''}</span>`;
+          }
+          html += '</div>';
+        });
+
+        html += '</div>'; // bar track
+        html += '</div>'; // machine row
+      });
+
+      html += '</div>'; // padding wrapper
+    }
+
+    html += '</div>'; // week-day-card
+  });
+
+  document.getElementById('weekViewContent').innerHTML = html;
 }
 
 // ── Tooltip ────────────────────────────────────────────
