@@ -885,11 +885,6 @@ def solve_schedule(
     # P+ Boost needs more time — priority terms make convergence slower
     effective_limit = time_limit_seconds + (300 if cfg.priority_boost else 0)
     solver.parameters.max_time_in_seconds = effective_limit
-    # Stop early when the solution is within 5% of the proven lower
-    # bound.  Most runs find a near-optimal solution in 30-60s and
-    # then spend 140+s squeezing out <2% improvement.  This lets the
-    # solver stop as soon as the gap is small enough.
-    solver.parameters.relative_gap_limit = 0.05
     # Use all available CPU cores. At 12+ workers, CP-SAT activates
     # additional sub-solver strategies (LNS, core-based, etc).
     solver.parameters.num_workers = min(15, os.cpu_count() or 8)
