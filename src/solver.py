@@ -874,7 +874,7 @@ def solve_schedule(
     solver.parameters.max_time_in_seconds = effective_limit
     # Use all available CPU cores. At 12+ workers, CP-SAT activates
     # additional sub-solver strategies (LNS, core-based, etc).
-    solver.parameters.num_workers = max(8, os.cpu_count() or 8)
+    solver.parameters.num_workers = min(15, os.cpu_count() or 8)
     # Log objective bound progression — useful for tuning weights.
     solver.parameters.log_search_progress = True
 

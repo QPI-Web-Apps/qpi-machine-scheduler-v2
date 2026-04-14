@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import os
@@ -350,52 +351,53 @@ async def create_schedule(
         tmp.write(content)
         tmp_path = tmp.name
 
-    try:
-        if parsed_groups:
-            # Multi-group: load once, partition jobs, schedule each group
-            jobs, skipped, germantown_jobs = load_jobs_from_excel(tmp_path, cfg)
-            group_jobs, extra_skipped = _assign_jobs_to_groups(jobs, parsed_groups)
-            all_skipped = skipped + extra_skipped
+    # Run the CPU-heavy solver in a thread so the async event loop
+    # stays responsive (health checks, other requests).  Without this,
+    # the 200s+ CP-SAT solve blocks uvicorn's single event loop and
+    # the server looks dead to load balancers / reverse proxies.
+    def _run_solver():
+        try:
+            if parsed_groups:
+                # Multi-group: load once, partition jobs, schedule each group
+                jobs, skipped, germantown_jobs = load_jobs_from_excel(tmp_path, cfg)
+                group_jobs, extra_skipped = _assign_jobs_to_groups(jobs, parsed_groups)
+                all_skipped = skipped + extra_skipped
 
-            group_results: dict[str, ScheduleResult] = {}
-            for gname, gdef in parsed_groups.items():
-                g_machines = gdef.get("machines", [])
-                g_max = gdef.get("max_concurrent", max_concurrent)
-                # Build per-group config: disable all machines NOT in this group
-                g_cfg = copy.deepcopy(cfg)
-                g_cfg.disabled_machines = [
-                    m for m in MACHINE_BY_ID if m not in g_machines
-                ]
-                g_jobs = group_jobs.get(gname, [])
-                group_results[gname] = generate_schedule_from_jobs(
-                    g_jobs, all_skipped, g_cfg, g_max
-                )
+                group_results: dict[str, ScheduleResult] = {}
+                for gname, gdef in parsed_groups.items():
+                    g_machines = gdef.get("machines", [])
+                    g_max = gdef.get("max_concurrent", max_concurrent)
+                    g_cfg = copy.deepcopy(cfg)
+                    g_cfg.disabled_machines = [
+                        m for m in MACHINE_BY_ID if m not in g_machines
+                    ]
+                    g_jobs = group_jobs.get(gname, [])
+                    group_results[gname] = generate_schedule_from_jobs(
+                        g_jobs, all_skipped, g_cfg, g_max
+                    )
 
-            result, groups_meta = _merge_results(group_results, parsed_groups)
-            result.germantown_jobs = germantown_jobs
-        else:
-            # Single-group: existing path
-            result = generate_schedule(tmp_path, cfg, max_concurrent=max_concurrent)
-            groups_meta = None
+                result, groups_meta = _merge_results(group_results, parsed_groups)
+                result.germantown_jobs = germantown_jobs
+            else:
+                result = generate_schedule(tmp_path, cfg, max_concurrent=max_concurrent)
+                groups_meta = None
 
-        # Always load the FULL yellow/pink list regardless of the user's
-        # filter choice. The publish flow writes every yellow/pink job to
-        # scheduler_yellow_pink_jobs (Sullivan ETL feed) — even ones the user
-        # excluded from the running schedule. Loaded with no machine
-        # restrictions so the list reflects all yellow/pink work in the input.
-        yp_cfg = copy.deepcopy(cfg)
-        yp_cfg.include_yellow = True
-        yp_cfg.include_pink = True
-        yp_cfg.disabled_machines = []
-        yp_cfg.disabled_stations = []
-        all_yp_raw, _, _ = load_jobs_from_excel(tmp_path, yp_cfg)
-        all_yp_jobs = [
-            j for j in all_yp_raw
-            if j.get("ticket_color")
-            and _YELLOW_PINK_RE.search(j["ticket_color"])
-        ]
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
+            yp_cfg = copy.deepcopy(cfg)
+            yp_cfg.include_yellow = True
+            yp_cfg.include_pink = True
+            yp_cfg.disabled_machines = []
+            yp_cfg.disabled_stations = []
+            all_yp_raw, _, _ = load_jobs_from_excel(tmp_path, yp_cfg)
+            all_yp_jobs = [
+                j for j in all_yp_raw
+                if j.get("ticket_color")
+                and _YELLOW_PINK_RE.search(j["ticket_color"])
+            ]
+            return result, groups_meta, all_yp_jobs
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+    result, groups_meta, all_yp_jobs = await asyncio.to_thread(_run_solver)
 
     schedule_id = str(uuid.uuid4())[:8]
     response_data = _result_to_json(result, cfg)
