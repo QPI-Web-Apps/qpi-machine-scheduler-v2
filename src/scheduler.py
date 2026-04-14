@@ -551,18 +551,6 @@ def _collect_crew_events(
             if e.entry_type != "JOB":
                 continue
             prev = m_entries[i - 1] if i > 0 else None
-            # On self-service machines the crew stays through TOOL_SWAP
-            # even if there's a short NOT_RUNNING gap after the swap
-            # (solver slack).  Pattern: TOOL_SWAP → NOT_RUNNING → JOB
-            # means crew carried through — no external crew needed.
-            # Only applies to short gaps (≤30 min); longer gaps mean the
-            # solver intentionally delayed the next batch.
-            if (prev is not None
-                    and prev.entry_type == "NOT_RUNNING"
-                    and i >= 2
-                    and m_entries[i - 2].entry_type == "TOOL_SWAP"
-                    and (e.start - prev.start).total_seconds() <= 1800):
-                continue
             if prev is None or prev.entry_type not in ("JOB", "TOOL_SWAP"):
                 needs_crew.add((e.machine_id, e.start))
 
@@ -590,18 +578,7 @@ def _collect_crew_events(
                     freed_by_eow.add((machine_id, e.end))
             elif next_entry.entry_type == "TOOL_SWAP":
                 after_swap = m_entries[i + 2] if i + 2 < len(m_entries) else None
-                # Look past a short NOT_RUNNING gap after the swap — on
-                # self-service machines the crew does the swap themselves,
-                # so solver slack between TOOL_SWAP and the next JOB
-                # doesn't mean the crew left.  Pattern: JOB → TOOL_SWAP
-                # → NOT_RUNNING(≤30min) → JOB means crew carries through.
-                if (after_swap is not None
-                        and after_swap.entry_type == "NOT_RUNNING"
-                        and i + 3 < len(m_entries)
-                        and m_entries[i + 3].entry_type == "JOB"
-                        and (after_swap.end - after_swap.start).total_seconds() <= 1800):
-                    pass  # crew stays — don't free
-                elif after_swap is None or after_swap.entry_type != "JOB":
+                if after_swap is None or after_swap.entry_type != "JOB":
                     hc = e.headcount or 0
                     if hc:
                         freed_events.append((next_entry.end, machine_id, hc, "end_of_work", next_entry))
