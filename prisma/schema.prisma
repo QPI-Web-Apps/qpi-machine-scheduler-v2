@@ -43,6 +43,27 @@ model scheduler_yellow_pink_jobs {
   @@index([published_at])
 }
 
+model scheduler_germantown_jobs {
+  id                  Int       @id @default(autoincrement())
+  published_at        DateTime  @db.DateTime2
+  so_number           String    @db.NVarChar(50)
+  finished_item       String?   @db.NVarChar(100)
+  description         String?   @db.NVarChar(500)
+  customer            String?   @db.NVarChar(255)
+  tool_id             String?   @db.NVarChar(50)
+  eqp_code            String?   @db.NVarChar(50)
+  remaining_qty       Decimal?  @db.Decimal(12, 2)
+  run_hours           Decimal?  @db.Decimal(8, 2)
+  headcount           Decimal?  @db.Decimal(5, 2)
+  due_date            DateTime? @db.Date
+  priority_str        String?   @db.NVarChar(50)
+  ticket_color        String?   @db.NVarChar(20)
+  processed_indicator String    @default("n") @db.NVarChar(1)
+
+  @@index([processed_indicator])
+  @@index([published_at])
+}
+
 model scheduler_published_schedule {
   id                  Int       @id @default(autoincrement())
   published_at        DateTime  @db.DateTime2

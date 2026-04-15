@@ -44,7 +44,7 @@ class SchedulerConfig:
     default_headcount: float = DEFAULT_HEADCOUNT
     h3_enabled: bool = True
     initial_tools: dict[str, str] = field(default_factory=dict)
-    priority_boost: bool = False
+    priority_boost: bool = True
     minimize_late: bool = False
     hc_penalty_weight: float = 30  # minutes-equivalent cost per HC unit of change
     total_crew: int = 0  # max total headcount across concurrent jobs (0 = unlimited)
