@@ -375,6 +375,18 @@ async def create_schedule(
                     group_results[gname] = generate_schedule_from_jobs(
                         g_jobs, all_skipped, g_cfg, g_max
                     )
+                    # If this group solver couldn't produce a schedule, its
+                    # jobs would otherwise vanish silently (not in entries,
+                    # not in skipped_jobs). Surface them as skipped with a
+                    # reason that points at the group, so the UI accounts
+                    # for every input row.
+                    if group_results[gname].solver_status not in ("OPTIMAL", "FEASIBLE"):
+                        status_label = group_results[gname].solver_status.lower()
+                        for job in g_jobs:
+                            all_skipped.append({
+                                "reason": f"group {gname} solver {status_label}",
+                                "so_number": job.get("so_number"),
+                            })
 
                 result, groups_meta = _merge_results(group_results, parsed_groups)
                 result.germantown_jobs = germantown_jobs

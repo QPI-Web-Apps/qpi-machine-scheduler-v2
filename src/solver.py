@@ -379,10 +379,16 @@ def solve_schedule(
 
     model = cp_model.CpModel()
 
-    # Horizon: max single-machine load + total changeover serialization + buffer.
-    # Machines run in parallel, so the schedule length is bounded by the
-    # most loaded machine, not the sum of all work.  Changeovers are
-    # serialized (no-overlap), so we add total_co as worst-case blocking.
+    # Horizon: must fit both the parallel-machine case AND the forced-
+    # serialization case (when max_concurrent is small relative to the
+    # number of machines with work).
+    #
+    # Parallel bound  = heaviest single machine's load + total CO blocking.
+    # Serialized bound = total work across all machines / max_concurrent.
+    #
+    # Taking the max of both lets max_concurrent=1 work even when it
+    # forces end-to-end serialization across machines.  Without this,
+    # presolve proves infeasible before the solver ever branches.
     machine_batch_counts: dict[str, int] = {}
     for b in batches:
         machine_batch_counts[b.machine_id] = machine_batch_counts.get(b.machine_id, 0) + 1
@@ -399,7 +405,20 @@ def solve_schedule(
               if MACHINE_BY_ID[mid].has_changeovers else 0)
         machine_loads[mid] = work + co
     max_machine_load = max(machine_loads.values()) if machine_loads else 0
-    horizon = max_machine_load + total_co + 480  # + serialized CO blocking + shift buffer
+
+    # Serialized bound: what if max_concurrent forces all work through a
+    # narrow throat?  Total work + all CO time, divided by how many batches
+    # can run at once.  Ceiling division to avoid off-by-one.
+    total_work = sum(b.total_minutes for b in batches)
+    total_all_co = sum(
+        count * round(MACHINE_BY_ID[mid].changeover_hours * 60)
+        for mid, count in machine_batch_counts.items()
+        if MACHINE_BY_ID[mid].has_changeovers
+    )
+    mc_denom = max(1, max_concurrent)
+    serialized_bound = (total_work + total_all_co + mc_denom - 1) // mc_denom
+
+    horizon = max(max_machine_load, serialized_bound) + total_co + 480
 
     # ── Variables ────────────────────────────────────────────────
 
