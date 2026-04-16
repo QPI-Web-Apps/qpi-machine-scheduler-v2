@@ -39,6 +39,14 @@
       <input type="number" id="maxConcurrent" value="5" min="1" max="9">
     </div>
     <div class="control-group">
+      <label title="Max concurrent crew across all machines. 0 = unlimited. Soft cap — solver heavily penalizes exceeding it but can breach for pinned in-progress work.">Crew cap</label>
+      <input type="number" id="totalCrew" value="0" min="0" max="200" step="1" style="width:64px;">
+    </div>
+    <div class="control-group">
+      <label title="Cap enforcement strictness. 100=advisory (priority wins), 500=balanced (default), 2000=strict (cap dominates), 5000+=near-hard.">Strictness</label>
+      <input type="number" id="crewCapWeight" value="500" min="100" max="10000" step="100" style="width:72px;">
+    </div>
+    <div class="control-group">
       <label>Include</label>
       <label class="ticket-toggle"><input type="checkbox" id="inclYellow"><span class="ticket-chip yellow">Yellow</span></label>
       <label class="ticket-toggle"><input type="checkbox" id="inclPink"><span class="ticket-chip pink">Pink</span></label>
@@ -108,6 +116,7 @@
   <div class="stat-card"><div class="label">Jobs Scheduled</div><div class="value blue" id="statJobs">-</div></div>
   <div class="stat-card"><div class="label">Makespan</div><div class="value" id="statMakespan">-</div></div>
   <div class="stat-card"><div class="label">Crew Movements</div><div class="value orange" id="statCrew">-</div></div>
+  <div class="stat-card" id="statCrewCapCard" style="display:none;"><div class="label" id="statCrewCapLabel">Crew Peak / Cap</div><div class="value" id="statCrewCap">-</div></div>
   <div class="stat-card"><div class="label">Skipped</div><div class="value" id="statSkipped">-</div></div>
   <div class="stat-card"><div class="label">On Time</div><div class="value green" id="statOnTime">-</div></div>
   <div class="stat-card"><div class="label">Past Due</div><div class="value" id="statPastDue" style="color:var(--red)">-</div></div>
@@ -417,17 +426,20 @@ const HARDCODED_GROUPS = {
   'LMB': 'B', 'SMB': 'B', '6ST': 'B',
 };
 let groupMaxConcurrent = { A: 3, B: 1 };
+let groupCrewCap = { A: 0, B: 0 };  // 0 = unlimited; applied per-group in multi-group mode
 
 function renderGroupGrid() {
   let html = '';
 
-  // Per-group max concurrent controls
+  // Per-group max concurrent + crew cap controls
   html += '<div class="mg-controls">';
   GROUP_NAMES.forEach(g => {
     const machines = MACHINE_ORDER.filter(mid => HARDCODED_GROUPS[mid] === g);
     html += `<div class="mg-max-input"><span class="mg-max-dot" style="background:${GROUP_COLORS[g]}"></span>`;
     html += `<span class="mg-max-label">${g} max</span>`;
     html += `<input type="number" min="1" max="9" value="${groupMaxConcurrent[g]}" class="mg-max-field" onchange="groupMaxConcurrent['${g}']=parseInt(this.value)">`;
+    html += `<span class="mg-max-label" style="margin-left:12px;" title="Crew cap for group ${g}. 0 = unlimited. Soft cap.">${g} crew</span>`;
+    html += `<input type="number" min="0" max="200" value="${groupCrewCap[g] || 0}" class="mg-max-field" onchange="groupCrewCap['${g}']=parseInt(this.value)||0">`;
     html += `</div>`;
   });
   html += '</div>';
@@ -456,7 +468,11 @@ function getMachineGroups() {
   GROUP_NAMES.forEach(g => {
     const machines = MACHINE_ORDER.filter(mid => HARDCODED_GROUPS[mid] === g);
     if (machines.length > 0) {
-      groups[g] = { machines, max_concurrent: groupMaxConcurrent[g] || 5 };
+      groups[g] = {
+        machines,
+        max_concurrent: groupMaxConcurrent[g] || 5,
+        total_crew: groupCrewCap[g] || 0,
+      };
     }
   });
   return groups;
@@ -533,6 +549,8 @@ async function runSchedule() {
   formData.append('priority_boost', document.getElementById('prioBoost').checked);
   formData.append('minimize_late', false);
   formData.append('disabled_machines', JSON.stringify(getDisabledMachines()));
+  formData.append('total_crew', document.getElementById('totalCrew').value || '0');
+  formData.append('crew_cap_weight', document.getElementById('crewCapWeight').value || '500');
   const groups = getMachineGroups();
   if (Object.keys(groups).length > 0) {
     formData.append('machine_groups', JSON.stringify(groups));
@@ -607,11 +625,14 @@ function saveScheduleJson() {
       include_white: document.getElementById('inclWhite').checked,
       priority_boost: document.getElementById('prioBoost').checked,
       minimize_late: false,
+      total_crew: document.getElementById('totalCrew').value || '0',
+      crew_cap_weight: document.getElementById('crewCapWeight').value || '500',
       shift_config: shiftConfig,
       disabled_machines: getDisabledMachines(),
       initial_tools: getInitialTools(),
       machine_groups: getMachineGroups(),
-      group_max_concurrent: groupMaxConcurrent
+      group_max_concurrent: groupMaxConcurrent,
+      group_crew_cap: groupCrewCap
     },
     scheduleData: scheduleData
   };
@@ -947,6 +968,8 @@ function restoreConfig(config) {
   if (config.include_pink !== undefined) document.getElementById('inclPink').checked = config.include_pink;
   if (config.include_white !== undefined) document.getElementById('inclWhite').checked = config.include_white;
   if (config.priority_boost !== undefined) document.getElementById('prioBoost').checked = config.priority_boost;
+  if (config.total_crew !== undefined) document.getElementById('totalCrew').value = config.total_crew;
+  if (config.crew_cap_weight !== undefined) document.getElementById('crewCapWeight').value = config.crew_cap_weight;
   if (config.shift_config && typeof config.shift_config === 'object') {
     shiftConfig = config.shift_config;
     initShiftGrid();
@@ -961,6 +984,11 @@ function restoreConfig(config) {
   }
   if (config.group_max_concurrent) {
     Object.assign(groupMaxConcurrent, config.group_max_concurrent);
+  }
+  if (config.group_crew_cap) {
+    Object.assign(groupCrewCap, config.group_crew_cap);
+  }
+  if (config.group_max_concurrent || config.group_crew_cap) {
     renderGroupGrid();
   }
 }
@@ -982,6 +1010,44 @@ function onScheduleLoaded() {
   document.getElementById('statCrew').textContent = scheduleData.crew_movements.length;
   document.getElementById('statSkipped').textContent = scheduleData.skipped_count;
   document.getElementById('statRunId').textContent = scheduleData.schedule_id || '-';
+
+  // Crew cap reporting — three modes:
+  //   1. Per-group caps (multi-group + at least one group has a cap set)
+  //   2. Single global cap (no groups, or groups without per-group caps)
+  //   3. No cap (hide card entirely)
+  const capCard = document.getElementById('statCrewCapCard');
+  const capEl = document.getElementById('statCrewCap');
+  const capLabel = document.getElementById('statCrewCapLabel');
+
+  const groups = scheduleData.groups || null;
+  const perGroupCaps = groups
+    ? Object.entries(groups).filter(([_, g]) => g.crew_cap && g.crew_cap > 0)
+    : [];
+
+  if (perGroupCaps.length > 0) {
+    capCard.style.display = 'block';
+    capLabel.textContent = 'Crew per Group';
+    const parts = perGroupCaps.map(([g, info]) => {
+      const peak = info.crew_peak || 0;
+      const cap = info.crew_cap;
+      const over = peak > cap;
+      const color = over ? (peak > cap * 1.15 ? 'var(--red)' : 'var(--orange)') : 'var(--green)';
+      return `<span style="color:${color}">${g}: ${peak}/${cap}</span>`;
+    });
+    capEl.innerHTML = parts.join(' · ');
+    capEl.style.color = '';  // per-span colors
+  } else if (scheduleData.crew_cap && scheduleData.crew_cap > 0) {
+    const peak = scheduleData.crew_peak || 0;
+    const cap = scheduleData.crew_cap;
+    capCard.style.display = 'block';
+    capLabel.textContent = 'Crew Peak / Cap';
+    capEl.textContent = `${peak} / ${cap}`;
+    if (peak <= cap) capEl.style.color = 'var(--green)';
+    else if (peak <= cap * 1.15) capEl.style.color = 'var(--orange)';
+    else capEl.style.color = 'var(--red)';
+  } else {
+    capCard.style.display = 'none';
+  }
 
   // Delivery stats
   let onTime = 0, pastDue = 0, finishLate = 0;
@@ -1661,12 +1727,20 @@ function renderHeadcount() {
 
   const overallPeak = Math.max(...rows.map(r => r.peak));
   const overallAvg = rows.length ? rows.reduce((s, r) => s + r.avg, 0) / rows.length : 0;
+  const crewCap = scheduleData.crew_cap || 0;
 
   // Summary cards
   let html = '<div class="day-summary" style="margin-bottom:16px;">';
   html += card('Peak Shift HC', Math.round(overallPeak) + ' workers');
   html += card('Avg Shift HC', overallAvg.toFixed(1) + ' workers');
   html += card('Schedule Days', scheduleDays.length);
+  if (crewCap > 0) {
+    const overCnt = rows.filter(r => r.peak > crewCap).length;
+    const capLabel = overCnt > 0
+      ? `${crewCap} (over in ${overCnt} shift${overCnt === 1 ? '' : 's'})`
+      : `${crewCap} (all shifts within cap)`;
+    html += card('Crew Cap', capLabel);
+  }
   html += '</div>';
 
   // Table
@@ -1677,18 +1751,24 @@ function renderHeadcount() {
 
   rows.forEach(row => {
     const isPeak = row.peak === overallPeak && overallPeak > 0;
+    const overCap = crewCap > 0 && row.peak > crewCap;
     const cls = [];
     if (isPeak) cls.push('hc-peak');
     if (row.shift === 2) cls.push('hc-shift2');
+    if (overCap) cls.push('hc-over-cap');
 
-    html += `<tr class="${cls.join(' ')}">`;
+    const rowStyle = overCap
+      ? ' style="background:rgba(239,68,68,0.12);"'
+      : '';
+    html += `<tr class="${cls.join(' ')}"${rowStyle}>`;
 
     if (row.shift === 1) {
       const dayLabel = row.day.toLocaleDateString('en-US', { weekday:'short', month:'numeric', day:'numeric' });
       html += `<td class="day-cell" rowspan="2">${dayLabel}</td>`;
     }
 
-    html += `<td class="shift-cell">${row.shift}</td>`;
+    const peakLabel = crewCap > 0 ? ` (peak ${Math.round(row.peak)}${overCap ? ' > cap' : ''})` : '';
+    html += `<td class="shift-cell" title="Shift ${row.shift}${peakLabel}">${row.shift}</td>`;
 
     MACHINE_ORDER.forEach(mid => {
       const hc = row.machineHC[mid];

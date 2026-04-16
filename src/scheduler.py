@@ -62,6 +62,11 @@ class ScheduleResult:
     makespan_hours: float
     solver_status: str
     germantown_jobs: list[dict] = field(default_factory=list)
+    crew_cap: int = 0                # configured cap at solve time (0 = unlimited)
+    crew_peak_solver: int = 0        # peak the solver projected
+    crew_peak_actual: float = 0.0    # peak recomputed from assembled entries
+    crew_peak_time: Optional[datetime] = None   # when the actual peak occurred
+    crew_overflow_sum: int = 0       # solver's Σ overflow at check points
 
 
 # Minimum gap (hours) to generate a NOT_RUNNING entry.  Gaps smaller
@@ -137,13 +142,16 @@ def generate_schedule_from_jobs(
 ) -> ScheduleResult:
     """Core pipeline: optimize → assemble → annotate crew. No Excel loading."""
     if not jobs:
-        return ScheduleResult([], [], skipped, 0.0, "NO_JOBS")
+        return ScheduleResult([], [], skipped, 0.0, "NO_JOBS", crew_cap=cfg.total_crew)
 
     machine_jobs = assign_jobs_to_machines(jobs, cfg)
     batches = build_tool_batches(machine_jobs)
     result = solve_schedule(batches, cfg, max_concurrent=max_concurrent)
     if result.status not in ("OPTIMAL", "FEASIBLE"):
-        return ScheduleResult([], [], skipped, 0.0, result.status)
+        return ScheduleResult(
+            [], [], skipped, 0.0, result.status,
+            crew_cap=result.crew_cap,
+        )
 
     entries = _assemble_schedule(result, cfg)
     # H3 stagger disabled — solver-level NoOverlap on changeover intervals
@@ -151,13 +159,72 @@ def generate_schedule_from_jobs(
     # overlaps by sliding changeovers without the full constraint picture.
     crew_movements = _compute_crew_movements(entries, cfg)
 
+    peak_hc, peak_time = compute_crew_peak(entries)
+
     return ScheduleResult(
         entries=entries,
         crew_movements=crew_movements,
         skipped_jobs=skipped,
         makespan_hours=result.makespan_minutes / 60.0,
         solver_status=result.status,
+        crew_cap=result.crew_cap,
+        crew_peak_solver=result.crew_peak_solver,
+        crew_peak_actual=peak_hc,
+        crew_peak_time=peak_time,
+        crew_overflow_sum=result.crew_overflow_sum,
     )
+
+
+def compute_crew_peak(
+    entries: list[ScheduleEntry],
+) -> tuple[float, Optional[datetime]]:
+    """Walk the assembled timeline and find the peak concurrent HC.
+
+    Counts JOB, CHANGEOVER, and TOOL_SWAP entries — every one of those
+    consumes crew.  Returns (peak_hc, peak_time).  peak_time is the
+    first moment the peak is reached.
+
+    Timestamps are rounded to the nearest minute before event-sorting.
+    The solver works in integer staffed-minutes, but assembly uses
+    fractional hours via add_staffed_hours; that accumulates sub-minute
+    rounding error (e.g., a JOB ending at 12:23:01.68 while the next CO
+    starts at 12:23:00 sharp).  Those 1-2 second "overlaps" aren't real
+    — they're just two different rounding paths landing near the same
+    minute boundary — so we collapse them.
+    """
+    def _to_minute(dt: datetime) -> datetime:
+        # Round to nearest minute — 30+ seconds rounds up.
+        rounded = dt.replace(second=0, microsecond=0)
+        if dt.second >= 30 or (dt.second == 29 and dt.microsecond >= 500000):
+            rounded += timedelta(minutes=1)
+        return rounded
+
+    events: list[tuple[datetime, int, float]] = []
+    # Sort key: (time, kind) — end events (kind=0) fire before start (kind=1)
+    # at coincident times, so an exiting batch doesn't fake-inflate the peak
+    # when another batch starts at the same instant.
+    for e in entries:
+        if e.entry_type not in ("JOB", "CHANGEOVER", "TOOL_SWAP"):
+            continue
+        hc = e.headcount or 0
+        if hc <= 0:
+            continue
+        events.append((_to_minute(e.start), 1, hc))
+        events.append((_to_minute(e.end), 0, -hc))
+
+    if not events:
+        return 0.0, None
+
+    events.sort(key=lambda ev: (ev[0], ev[1]))
+    peak = 0.0
+    peak_t: Optional[datetime] = None
+    cur = 0.0
+    for t, _kind, delta in events:
+        cur += delta
+        if cur > peak:
+            peak = cur
+            peak_t = t
+    return peak, peak_t
 
 
 # ── Assembly: solver batches → schedule entries ─────────────────────
@@ -239,6 +306,8 @@ def _assemble_schedule(
 
                 # Upfront CO entry, ending exactly at the first JOB's start.
                 entry_type = "TOOL_SWAP" if spec.self_service_changeover else "CHANGEOVER"
+                # CO crew = max HC of the batch being set up (matches solver model)
+                co_hc = max((j["headcount"] for j in first_sb.batch.jobs), default=0)
                 entries.append(ScheduleEntry(
                     machine_id=machine_id,
                     entry_type=entry_type,
@@ -246,6 +315,7 @@ def _assemble_schedule(
                     end=first_start,
                     tool_id=f"{init_tool} -> {first_sb.batch.tool_id}",
                     shift=which_shift(co_start_dt, spd),
+                    headcount=co_hc,
                 ))
 
                 # The first batch is now "preceded" by the upfront CO, so the
@@ -290,6 +360,8 @@ def _assemble_schedule(
                 co_end_aligned = align_to_working_time(co_end, spd)
 
                 entry_type = "TOOL_SWAP" if spec.self_service_changeover else "CHANGEOVER"
+                # CO crew = max HC of the batch being set up (matches solver model)
+                co_hc = max((j["headcount"] for j in batch.jobs), default=0)
                 entries.append(ScheduleEntry(
                     machine_id=machine_id,
                     entry_type=entry_type,
@@ -297,6 +369,7 @@ def _assemble_schedule(
                     end=co_end,
                     tool_id=f"{prev_tool} -> {batch.tool_id}",
                     shift=which_shift(co_start, spd),
+                    headcount=co_hc,
                 ))
 
                 # If there's a gap between changeover end and batch start,

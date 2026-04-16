@@ -134,6 +134,13 @@ def _result_to_json(result: ScheduleResult, cfg: SchedulerConfig) -> dict:
         "machines": machine_summary,
         "crew_movements": crew_json,
         "skipped_jobs": result.skipped_jobs[:50],  # cap for response size
+        "crew_cap": result.crew_cap,
+        "crew_peak": round(result.crew_peak_actual, 1),
+        "crew_peak_solver": result.crew_peak_solver,
+        "crew_peak_time": (
+            result.crew_peak_time.isoformat() if result.crew_peak_time else None
+        ),
+        "crew_overflow_sum": result.crew_overflow_sum,
     }
 
 
@@ -229,6 +236,9 @@ def _merge_results(
             "solver_status": result.solver_status,
             "makespan_hours": round(result.makespan_hours, 1),
             "total_jobs": len([e for e in result.entries if e.entry_type == "JOB"]),
+            "crew_cap": result.crew_cap,
+            "crew_peak": round(result.crew_peak_actual, 1),
+            "crew_overflow_sum": result.crew_overflow_sum,
         }
 
     all_entries.sort(key=lambda e: (e.start, e.machine_id))
@@ -244,12 +254,32 @@ def _merge_results(
             seen_so.add(key)
         deduped_skipped.append(s)
 
+    # Each group may have its own crew cap (distinct pools) or share an
+    # implicit top-level cap (same value repeated).  Top-level merged cap
+    # is the SUM of group caps — this represents the total plant crew
+    # across all groups, which is what the UI summary card displays.
+    # If any group is uncapped (0), the total cap is undefined → 0.
+    from .scheduler import compute_crew_peak
+    caps = [r.crew_cap for r in group_results.values()]
+    if caps and all(c > 0 for c in caps):
+        merged_cap = sum(caps)
+    else:
+        merged_cap = 0
+    merged_peak, merged_peak_t = compute_crew_peak(all_entries)
+    solver_peak = max((r.crew_peak_solver for r in group_results.values()), default=0)
+    overflow_sum = sum(r.crew_overflow_sum for r in group_results.values())
+
     merged = ScheduleResult(
         entries=all_entries,
         crew_movements=all_crew,
         skipped_jobs=deduped_skipped,
         makespan_hours=max_makespan,
         solver_status=worst_status,
+        crew_cap=merged_cap,
+        crew_peak_solver=solver_peak,
+        crew_peak_actual=merged_peak,
+        crew_peak_time=merged_peak_t,
+        crew_overflow_sum=overflow_sum,
     )
     return merged, groups_meta
 
@@ -277,6 +307,7 @@ async def create_schedule(
     disabled_machines: str = Form(default=""),
     hc_penalty_weight: float = Form(default=30),
     total_crew: int = Form(default=0),
+    crew_cap_weight: int = Form(default=500),
     machine_groups: str = Form(default=""),
 ):
     """Upload Excel, generate schedule, return JSON."""
@@ -308,6 +339,7 @@ async def create_schedule(
         disabled_machines=disabled_machines_list,
         hc_penalty_weight=hc_penalty_weight,
         total_crew=total_crew,
+        crew_cap_weight=crew_cap_weight,
     )
 
     # Parse per-machine-per-day shift config if provided
@@ -371,6 +403,14 @@ async def create_schedule(
                     g_cfg.disabled_machines = [
                         m for m in MACHINE_BY_ID if m not in g_machines
                     ]
+                    # Per-group crew cap overrides the top-level total_crew.
+                    # Group value 0 (or missing) → inherit top-level cfg.total_crew.
+                    # Group value >0 → override.  This lets users set a single
+                    # global cap without filling in every group's field.
+                    group_cap = gdef.get("total_crew")
+                    if group_cap is not None and int(group_cap) > 0:
+                        g_cfg.total_crew = int(group_cap)
+                    # else: keep top-level cfg.total_crew (already in g_cfg copy)
                     g_jobs = group_jobs.get(gname, [])
                     group_results[gname] = generate_schedule_from_jobs(
                         g_jobs, all_skipped, g_cfg, g_max

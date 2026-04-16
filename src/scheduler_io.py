@@ -48,6 +48,8 @@ class SchedulerConfig:
     minimize_late: bool = False
     hc_penalty_weight: float = 30  # minutes-equivalent cost per HC unit of change
     total_crew: int = 0  # max total headcount across concurrent jobs (0 = unlimited)
+    crew_cap_weight: int = 500  # per-person overflow penalty. higher = stricter cap enforcement.
+                                # 100=advisory, 500=balanced (default), 2000=strict, 5000+=near-hard.
 
     def get_day_shift_map(self, machine_id: str):
         """Return per-day shift map for a machine, or int fallback."""

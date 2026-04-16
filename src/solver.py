@@ -48,6 +48,9 @@ class SolverResult:
     scheduled_batches: list[ScheduledBatch]
     makespan_minutes: int
     status: str  # "OPTIMAL", "FEASIBLE", "INFEASIBLE", etc.
+    crew_cap: int = 0            # cfg.total_crew at solve time (0 = unlimited)
+    crew_peak_solver: int = 0    # peak concurrent crew the solver projected
+    crew_overflow_sum: int = 0   # Σ overflow over check points (0 if within cap)
 
 
 # ── Stage 1: Assign jobs to machines ────────────────────────────────
@@ -449,6 +452,14 @@ def solve_schedule(
     # co_start_vars[batch_id] = [(arc_lit, co_start_var), ...]
     co_start_vars: dict[int, list[tuple[cp_model.IntVar, cp_model.IntVar]]] = {}
 
+    # Changeover crew items for the soft headcount cap.  Each CO consumes
+    # the same crew that runs the machine it precedes — so demand equals
+    # the max HC of the following batch.  The arc literal gates presence:
+    # if the arc isn't chosen by the circuit, the CO doesn't occur and
+    # contributes zero demand.
+    # Entry: (machine_id, start_var, end_var, demand, arc_lit)
+    co_crew_items: list[tuple[str, cp_model.IntVar, cp_model.IntVar, int, cp_model.IntVar]] = []
+
     for machine_id, m_batches in machine_batches.items():
         if not m_batches:
             continue
@@ -491,6 +502,11 @@ def solve_schedule(
                 # Track: initial CO starts at minute 0
                 ico_start = model.new_int_var(0, 0, f"ico_s_{machine_id}_{bi.batch_id}")
                 co_start_vars.setdefault(bi.batch_id, []).append((first_lit, ico_start))
+                # Crew item: CO crew demand = max HC of the batch being set up
+                ico_demand = max(1, int(math.ceil(max(j["headcount"] for j in bi.jobs))))
+                co_crew_items.append(
+                    (machine_id, ico_start, co_end, ico_demand, first_lit)
+                )
 
             # Arc: batch i+1 → depot (0) — batch i is last
             last_lit = model.new_bool_var(f"last_{machine_id}_{bi.batch_id}")
@@ -530,6 +546,11 @@ def solve_schedule(
                     co_arcs.setdefault(machine_id, {})[(i, j)] = lit
                     # Track: CO before batch j when arc i→j is active
                     co_start_vars.setdefault(bj.batch_id, []).append((lit, co_start))
+                    # Crew item: CO crew demand = max HC of the batch being set up
+                    co_demand = max(1, int(math.ceil(max(j["headcount"] for j in bj.jobs))))
+                    co_crew_items.append(
+                        (machine_id, co_start, co_end_var, co_demand, lit)
+                    )
                 else:
                     model.add(
                         starts[bj.batch_id] >= ends[bi.batch_id]
@@ -732,16 +753,129 @@ def solve_schedule(
     all_demands = [1] * len(batches)
     model.add_cumulative(all_intervals, all_demands, max_concurrent)
 
-    # ── Crew headcount capacity (cumulative) ────────────────────
-    # Prevents the solver from scheduling more total headcount
-    # than the available workforce across concurrent batches.
+    # ── Soft crew headcount cap (event-point overflow) ──────────
+    #
+    # The user-configured crew cap is a *soft* constraint: exceeding it
+    # is allowed but heavily penalized.  This lets jobs already in
+    # progress (pinned at t=0) coexist with cap values below their
+    # combined HC demand, instead of making the model infeasible.
+    #
+    # Method: for each "check point" (= start of a batch or CO), sum
+    # the demand of every crew-consuming item active at that moment.
+    # Overflow_k = max(0, demand_at_k - cap).  Because demand is a
+    # piecewise-constant step function that only rises at item starts,
+    # checking at every start captures the peak over the horizon.
+    #
+    # Crew items include both job batches and changeover intervals —
+    # COs consume the same crew that will run the machine they set up.
+    # This closes the gap where the old hard cumulative ignored CO
+    # demand, letting the solver undercount by a full machine's worth
+    # of crew for 2-hour windows.
 
-    if cfg.total_crew > 0:
-        # Use ceiling rather than round: a fractional 11.4 headcount
-        # demand still occupies 12 people on the floor, and rounding
-        # down can cause the solver to over-schedule concurrent crew.
-        hc_demands = [max(1, int(math.ceil(b.dominant_headcount))) for b in batches]
-        model.add_cumulative(all_intervals, hc_demands, cfg.total_crew)
+    crew_overflow_vars: list[cp_model.IntVar] = []
+    crew_demand_vars: list[cp_model.IntVar] = []  # for peak reporting
+
+    if cfg.total_crew > 0 and batches:
+        cap = cfg.total_crew
+
+        # Per-item demand uses MAX job HC in the batch, not dominant
+        # (time-weighted avg).  Max is a safe upper bound — with HC
+        # bucket splitting the gap is small, but max never undercounts.
+        def _batch_max_hc(b: ToolBatch) -> int:
+            return max(1, int(math.ceil(max(j["headcount"] for j in b.jobs))))
+
+        # Build unified crew-item table: (owner_machine, start, end, demand, presence_lit)
+        # presence_lit=None means "always present" (batches are always scheduled).
+        crew_items: list[tuple[str, cp_model.IntVar, cp_model.IntVar, int,
+                                Optional[cp_model.IntVar]]] = []
+        for b in batches:
+            crew_items.append(
+                (b.machine_id, starts[b.batch_id], ends[b.batch_id],
+                 _batch_max_hc(b), None)
+            )
+        for (mid, s_var, e_var, demand, lit) in co_crew_items:
+            crew_items.append((mid, s_var, e_var, demand, lit))
+
+        n_items = len(crew_items)
+        # Cap the overflow domain by total possible demand minus cap.
+        max_total_demand = sum(it[3] for it in crew_items)
+        overflow_ub = max(0, max_total_demand - cap)
+        if overflow_ub == 0:
+            # Cap is higher than the sum of ALL demands — can never overflow.
+            # Still add peak tracking so reporting works.
+            for i in range(n_items):
+                _, s_i, _, _, _ = crew_items[i]
+                # Demand at i's start: just the sum of self + trivial self-active
+                # With no possible overflow, peak_at_i is bounded by total demand
+                peak_i = model.new_int_var(0, max_total_demand, f"crew_peak_{i}")
+                # Without cross-pair tracking, just record self demand as floor
+                self_d = crew_items[i][3]
+                self_lit = crew_items[i][4]
+                if self_lit is None:
+                    model.add(peak_i == self_d)
+                else:
+                    # Active iff presence_lit true, else 0
+                    model.add(peak_i == self_d).only_enforce_if(self_lit)
+                    model.add(peak_i == 0).only_enforce_if(~self_lit)
+                crew_demand_vars.append(peak_i)
+        else:
+            # For each check point i, compute Σ demand of items active at t_i
+            # An item j is "active at time t" iff start_j <= t < end_j AND presence_j.
+            # We pre-filter j ∈ same-machine-as-i out — circuit enforces
+            # no temporal overlap on the same machine, so they can't both
+            # be active at the same moment (saves ~30% of pair bool vars).
+            for i in range(n_items):
+                mid_i, s_i, e_i, demand_i, lit_i = crew_items[i]
+
+                # Self-active term — i is always active at its own start
+                # (since start_i ≤ start_i < end_i whenever demand_i > 0 and interval is non-degenerate).
+                # For optional items, only count if presence_lit is true.
+                if lit_i is None:
+                    demand_terms = [demand_i]
+                else:
+                    self_active = model.new_bool_var(f"crew_self_act_{i}")
+                    model.add(self_active == lit_i)
+                    demand_terms = [demand_i * self_active]
+
+                for j in range(n_items):
+                    if i == j:
+                        continue
+                    mid_j, s_j, e_j, demand_j, lit_j = crew_items[j]
+                    if mid_j == mid_i:
+                        continue  # same machine → no overlap (circuit)
+
+                    # active_j_at_tI = (s_j ≤ s_i) AND (s_i < e_j) AND presence_j
+                    before = model.new_bool_var(f"crew_b_{i}_{j}")
+                    model.add(s_j <= s_i).only_enforce_if(before)
+                    model.add(s_j > s_i).only_enforce_if(~before)
+
+                    after = model.new_bool_var(f"crew_a_{i}_{j}")
+                    model.add(e_j > s_i).only_enforce_if(after)
+                    model.add(e_j <= s_i).only_enforce_if(~after)
+
+                    act = model.new_bool_var(f"crew_act_{i}_{j}")
+                    if lit_j is None:
+                        model.add_bool_and([before, after]).only_enforce_if(act)
+                        model.add_bool_or([~before, ~after]).only_enforce_if(~act)
+                    else:
+                        model.add_bool_and([before, after, lit_j]).only_enforce_if(act)
+                        model.add_bool_or([~before, ~after, ~lit_j]).only_enforce_if(~act)
+                    demand_terms.append(demand_j * act)
+
+                demand_at_i = model.new_int_var(0, max_total_demand, f"crew_dem_{i}")
+                model.add(demand_at_i == sum(demand_terms))
+                crew_demand_vars.append(demand_at_i)
+
+                overflow_i = model.new_int_var(0, overflow_ub, f"crew_ovf_{i}")
+                if lit_i is None:
+                    model.add(overflow_i >= demand_at_i - cap)
+                else:
+                    # Gate the overflow check: if this CO arc isn't chosen,
+                    # s_i is meaningless (unconstrained) — force overflow=0 so
+                    # we don't penalize a phantom check point.
+                    model.add(overflow_i >= demand_at_i - cap).only_enforce_if(lit_i)
+                    model.add(overflow_i == 0).only_enforce_if(~lit_i)
+                crew_overflow_vars.append(overflow_i)
 
     # ── Objective ────────────────────────────────────────────────
     #
@@ -863,15 +997,45 @@ def solve_schedule(
     if crew_idle_terms:
         crew_idle_term = CREW_IDLE_WEIGHT * sum(crew_idle_terms)
 
+    # ── Layer 2b: Soft crew-cap overflow ────────────────────────
+    # The soft cap sits between priority and tardiness in objective
+    # weight.  Scaling by n_batches matches the priority term's scale,
+    # so cap enforcement remains meaningful across problem sizes
+    # rather than getting washed out on large schedules.
+    #
+    # Behavior:
+    #   - Cap comfortably above demand → no overflow, zero cost.
+    #   - Cap modestly below peak → solver stretches makespan and
+    #     re-sequences to fit; small residual overflow at genuinely
+    #     unavoidable moments.
+    #   - Cap below pinned in-progress demand at t=0 → solver accepts
+    #     the single-moment breach (pinned, can't defer) and minimizes
+    #     every other overflow.
+    #
+    # Cap weight is user-configurable (cfg.crew_cap_weight).  Scaled by
+    # n_batches in objective so it remains comparable to priority on
+    # any problem size.  Typical values:
+    #   100  — advisory (cap loses to priority)
+    #   500  — balanced (default; cap edges priority)
+    #   2000 — strict (cap dominates priority, minor residual)
+    #   5000+— near-hard (solver treats cap as near-inviolable)
+    CREW_CAP_PENALTY = max(1, int(cfg.crew_cap_weight))
+    crew_cap_term = 0
+    if crew_overflow_vars:
+        crew_cap_term = CREW_CAP_PENALTY * sum(crew_overflow_vars)
+
     # ── Combine layers ─────────────────────────────────────────
-    # late_term >> prio_term >> makespan + hc_term + co_term + compact
+    # late_term >> prio_term, crew_cap_term >> makespan + hc + co + compact
     # Scale prio_term above makespan but below late_term
     has_prio = cfg.priority_boost or any(
         any(j.get("is_picked") for j in b.jobs) for b in batches
     )
     has_late = cfg.minimize_late and (late_vars or tardiness_vars)
 
-    objective = makespan + hc_term + co_term + sandwich_term + crew_idle_term + compact_term
+    objective = (makespan + hc_term + co_term + sandwich_term
+                 + crew_idle_term + compact_term)
+    if crew_overflow_vars:
+        objective += crew_cap_term * n_batches
     if has_prio:
         objective += prio_term * n_batches
     if has_late:
@@ -882,8 +1046,11 @@ def solve_schedule(
     # ── Solve ───────────────────────────────────────────────────
 
     solver = cp_model.CpSolver()
-    # P+ Boost needs more time — priority terms make convergence slower
+    # P+ Boost needs more time — priority terms make convergence slower.
+    # Soft crew cap adds O(N²) bool vars, also needing extra search time.
     effective_limit = time_limit_seconds + (300 if cfg.priority_boost else 0)
+    if cfg.total_crew > 0 and crew_overflow_vars:
+        effective_limit += 200
     solver.parameters.max_time_in_seconds = effective_limit
     # Use all available CPU cores. At 12+ workers, CP-SAT activates
     # additional sub-solver strategies (LNS, core-based, etc).
@@ -902,7 +1069,7 @@ def solve_schedule(
     }.get(status, "UNKNOWN")
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return SolverResult([], 0, status_name)
+        return SolverResult([], 0, status_name, crew_cap=cfg.total_crew)
 
     # ── Extract solution ────────────────────────────────────────
 
@@ -922,4 +1089,21 @@ def solve_schedule(
     scheduled.sort(key=lambda sb: (sb.start_minute, sb.batch.machine_id))
 
     ms = solver.value(makespan)
-    return SolverResult(scheduled, ms, status_name)
+
+    # Crew cap reporting: peak projected demand across check points,
+    # plus total overflow (0 if solver kept everything inside cap).
+    peak_demand = 0
+    overflow_sum = 0
+    if crew_demand_vars:
+        peak_demand = max((solver.value(v) for v in crew_demand_vars), default=0)
+    if crew_overflow_vars:
+        overflow_sum = sum(solver.value(v) for v in crew_overflow_vars)
+
+    return SolverResult(
+        scheduled_batches=scheduled,
+        makespan_minutes=ms,
+        status=status_name,
+        crew_cap=cfg.total_crew,
+        crew_peak_solver=peak_demand,
+        crew_overflow_sum=overflow_sum,
+    )
