@@ -272,7 +272,7 @@ async def create_schedule(
     include_white: bool = Form(default=False),
     shift_config: str = Form(default=""),
     initial_tools: str = Form(default=""),
-    priority_boost: bool = Form(default=False),
+    priority_boost: bool = Form(default=True),
     minimize_late: bool = Form(default=False),
     disabled_machines: str = Form(default=""),
     hc_penalty_weight: float = Form(default=30),
@@ -590,9 +590,10 @@ def export_schedule(schedule_id: str):
 
 # ── Publish to Portal_QPI ──────────────────────────────────────────
 #
-# Single "Publish Schedule" button (Matt, 2026-04-03 meeting) writes both:
+# Single "Publish Schedule" button (Matt, 2026-04-03 meeting) writes:
 #   • scheduler_yellow_pink_jobs   — yellow/pink jobs for the Sullivan ETL
 #   • scheduler_published_schedule — full schedule for plan-vs-actual analysis
+#   • scheduler_germantown_jobs    — green jobs with "Everything at STF" = N
 #
 # Both tables use a processed_indicator (Y/N) column copied from the existing
 # po_acknowledgement convention. On each publish: every existing row is flipped
@@ -698,6 +699,31 @@ def _yellow_pink_row_unscheduled(j: dict, published_at: datetime) -> dict:
     }
 
 
+def _germantown_row(j: dict, published_at: datetime) -> dict:
+    """Build one scheduler_germantown_jobs row from a Germantown job dict.
+
+    Germantown jobs are green-ticket rows with "Everything at STF" = N. They
+    are excluded from the running schedule but need to be surfaced so ops
+    can track what Germantown owes STF.
+    """
+    return {
+        "published_at": published_at,
+        "so_number": j.get("so_number") or "",
+        "finished_item": j.get("finished_item") or None,
+        "description": j.get("description") or None,
+        "customer": j.get("customer") or None,
+        "tool_id": j.get("tool_id") or None,
+        "eqp_code": j.get("eqp_code") or None,
+        "remaining_qty": j.get("remaining_qty"),
+        "run_hours": j.get("run_hours"),
+        "headcount": j.get("headcount"),
+        "due_date": j.get("due_date"),
+        "priority_str": j.get("priority_str") or None,
+        "ticket_color": j.get("ticket_color") or None,
+        "processed_indicator": "y",
+    }
+
+
 def _schedule_row(entry: ScheduleEntry, published_at: datetime) -> dict:
     """Build one scheduler_published_schedule row from any ScheduleEntry."""
     row = {
@@ -739,11 +765,11 @@ def _schedule_row(entry: ScheduleEntry, published_at: datetime) -> dict:
 def publish_schedule(schedule_id: str):
     """Publish the schedule to Portal_QPI.
 
-    Behavior, in one transaction:
-      1. UPDATE scheduler_yellow_pink_jobs   SET processed_indicator='n'
-      2. UPDATE scheduler_published_schedule SET processed_indicator='n'
-      3. INSERT new yellow/pink rows  with processed_indicator='y'
-      4. INSERT new schedule rows     with processed_indicator='y'
+    Behavior:
+      1. Flip all three scheduler tables to processed_indicator='n'
+      2. INSERT new yellow/pink rows   with processed_indicator='y'
+      3. INSERT new schedule rows      with processed_indicator='y'
+      4. INSERT new germantown rows    with processed_indicator='y'
     Returns row counts and the published_at timestamp.
     """
     stored = _results.get(schedule_id)
@@ -791,6 +817,7 @@ def publish_schedule(schedule_id: str):
             yp_rows.append(_yellow_pink_row_unscheduled(j, published_at))
 
     schedule_rows = [_schedule_row(e, published_at) for e in result.entries]
+    germantown_rows = [_germantown_row(j, published_at) for j in result.germantown_jobs]
 
     try:
         db = _get_prisma()
@@ -834,6 +861,10 @@ def publish_schedule(schedule_id: str):
             where={"processed_indicator": {"not": "n"}},
             data={"processed_indicator": "n"},
         )
+        flip.scheduler_germantown_jobs.update_many(
+            where={"processed_indicator": {"not": "n"}},
+            data={"processed_indicator": "n"},
+        )
         flip.commit()
 
         # Step 2 — insert yellow/pink rows in chunks.
@@ -843,6 +874,10 @@ def publish_schedule(schedule_id: str):
         # Step 3 — insert schedule rows in chunks.
         for chunk in _chunks(schedule_rows, _PUBLISH_CHUNK_SIZE):
             db.scheduler_published_schedule.create_many(data=chunk)
+
+        # Step 4 — insert germantown rows in chunks.
+        for chunk in _chunks(germantown_rows, _PUBLISH_CHUNK_SIZE):
+            db.scheduler_germantown_jobs.create_many(data=chunk)
     except Exception as exc:
         return JSONResponse(
             {
@@ -859,6 +894,7 @@ def publish_schedule(schedule_id: str):
         "published_at": published_at.isoformat(),
         "yellow_pink_count": len(yp_rows),
         "schedule_count": len(schedule_rows),
+        "germantown_count": len(germantown_rows),
     })
 
 
@@ -888,6 +924,16 @@ _VIEWABLE_TABLES: dict[str, dict] = {
             "remaining_qty", "run_hours", "headcount", "due_date",
             "priority_class", "ticket_color", "is_labeler", "is_bagger",
             "is_in_progress", "is_picked", "crew_from", "crew_to", "idle_type",
+        ],
+        "order_by": {"id": "desc"},
+    },
+    "scheduler_germantown_jobs": {
+        "accessor": lambda db: db.scheduler_germantown_jobs,
+        "columns": [
+            "id", "published_at", "processed_indicator", "so_number",
+            "finished_item", "description", "customer", "tool_id", "eqp_code",
+            "remaining_qty", "run_hours", "headcount", "due_date",
+            "priority_str", "ticket_color",
         ],
         "order_by": {"id": "desc"},
     },
