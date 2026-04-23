@@ -39,12 +39,8 @@
       <input type="number" id="maxConcurrent" value="5" min="1" max="9">
     </div>
     <div class="control-group">
-      <label title="Max concurrent crew across all machines. 0 = unlimited. Soft cap — solver heavily penalizes exceeding it but can breach for pinned in-progress work.">Crew cap</label>
+      <label title="Max concurrent crew headcount across all machines. 0 = unlimited. Hard constraint — solver will never exceed this limit.">Crew cap</label>
       <input type="number" id="totalCrew" value="0" min="0" max="200" step="1" style="width:64px;">
-    </div>
-    <div class="control-group">
-      <label title="Cap enforcement strictness. 100=advisory (priority wins), 500=balanced (default), 2000=strict (cap dominates), 5000+=near-hard.">Strictness</label>
-      <input type="number" id="crewCapWeight" value="500" min="100" max="10000" step="100" style="width:72px;">
     </div>
     <div class="control-group">
       <label>Include</label>
@@ -438,7 +434,7 @@ function renderGroupGrid() {
     html += `<div class="mg-max-input"><span class="mg-max-dot" style="background:${GROUP_COLORS[g]}"></span>`;
     html += `<span class="mg-max-label">${g} max</span>`;
     html += `<input type="number" min="1" max="9" value="${groupMaxConcurrent[g]}" class="mg-max-field" onchange="groupMaxConcurrent['${g}']=parseInt(this.value)">`;
-    html += `<span class="mg-max-label" style="margin-left:12px;" title="Crew cap for group ${g}. 0 = unlimited. Soft cap.">${g} crew</span>`;
+    html += `<span class="mg-max-label" style="margin-left:12px;" title="Crew cap for group ${g}. 0 = unlimited. Hard limit — solver will never exceed.">${g} crew</span>`;
     html += `<input type="number" min="0" max="200" value="${groupCrewCap[g] || 0}" class="mg-max-field" onchange="groupCrewCap['${g}']=parseInt(this.value)||0">`;
     html += `</div>`;
   });
@@ -550,7 +546,6 @@ async function runSchedule() {
   formData.append('minimize_late', false);
   formData.append('disabled_machines', JSON.stringify(getDisabledMachines()));
   formData.append('total_crew', document.getElementById('totalCrew').value || '0');
-  formData.append('crew_cap_weight', document.getElementById('crewCapWeight').value || '500');
   const groups = getMachineGroups();
   if (Object.keys(groups).length > 0) {
     formData.append('machine_groups', JSON.stringify(groups));
@@ -626,7 +621,6 @@ function saveScheduleJson() {
       priority_boost: document.getElementById('prioBoost').checked,
       minimize_late: false,
       total_crew: document.getElementById('totalCrew').value || '0',
-      crew_cap_weight: document.getElementById('crewCapWeight').value || '500',
       shift_config: shiftConfig,
       disabled_machines: getDisabledMachines(),
       initial_tools: getInitialTools(),
@@ -969,7 +963,6 @@ function restoreConfig(config) {
   if (config.include_white !== undefined) document.getElementById('inclWhite').checked = config.include_white;
   if (config.priority_boost !== undefined) document.getElementById('prioBoost').checked = config.priority_boost;
   if (config.total_crew !== undefined) document.getElementById('totalCrew').value = config.total_crew;
-  if (config.crew_cap_weight !== undefined) document.getElementById('crewCapWeight').value = config.crew_cap_weight;
   if (config.shift_config && typeof config.shift_config === 'object') {
     shiftConfig = config.shift_config;
     initShiftGrid();

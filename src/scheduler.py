@@ -66,7 +66,6 @@ class ScheduleResult:
     crew_peak_solver: int = 0        # peak the solver projected
     crew_peak_actual: float = 0.0    # peak recomputed from assembled entries
     crew_peak_time: Optional[datetime] = None   # when the actual peak occurred
-    crew_overflow_sum: int = 0       # solver's Σ overflow at check points
 
 
 # Minimum gap (hours) to generate a NOT_RUNNING entry.  Gaps smaller
@@ -171,7 +170,6 @@ def generate_schedule_from_jobs(
         crew_peak_solver=result.crew_peak_solver,
         crew_peak_actual=peak_hc,
         crew_peak_time=peak_time,
-        crew_overflow_sum=result.crew_overflow_sum,
     )
 
 

@@ -140,7 +140,6 @@ def _result_to_json(result: ScheduleResult, cfg: SchedulerConfig) -> dict:
         "crew_peak_time": (
             result.crew_peak_time.isoformat() if result.crew_peak_time else None
         ),
-        "crew_overflow_sum": result.crew_overflow_sum,
     }
 
 
@@ -238,7 +237,6 @@ def _merge_results(
             "total_jobs": len([e for e in result.entries if e.entry_type == "JOB"]),
             "crew_cap": result.crew_cap,
             "crew_peak": round(result.crew_peak_actual, 1),
-            "crew_overflow_sum": result.crew_overflow_sum,
         }
 
     all_entries.sort(key=lambda e: (e.start, e.machine_id))
@@ -267,7 +265,6 @@ def _merge_results(
         merged_cap = 0
     merged_peak, merged_peak_t = compute_crew_peak(all_entries)
     solver_peak = max((r.crew_peak_solver for r in group_results.values()), default=0)
-    overflow_sum = sum(r.crew_overflow_sum for r in group_results.values())
 
     merged = ScheduleResult(
         entries=all_entries,
@@ -279,7 +276,6 @@ def _merge_results(
         crew_peak_solver=solver_peak,
         crew_peak_actual=merged_peak,
         crew_peak_time=merged_peak_t,
-        crew_overflow_sum=overflow_sum,
     )
     return merged, groups_meta
 
@@ -307,7 +303,6 @@ async def create_schedule(
     disabled_machines: str = Form(default=""),
     hc_penalty_weight: float = Form(default=30),
     total_crew: int = Form(default=0),
-    crew_cap_weight: int = Form(default=500),
     machine_groups: str = Form(default=""),
 ):
     """Upload Excel, generate schedule, return JSON."""
@@ -339,7 +334,6 @@ async def create_schedule(
         disabled_machines=disabled_machines_list,
         hc_penalty_weight=hc_penalty_weight,
         total_crew=total_crew,
-        crew_cap_weight=crew_cap_weight,
     )
 
     # Parse per-machine-per-day shift config if provided
