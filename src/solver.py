@@ -333,6 +333,24 @@ def build_tool_batches(
             key = (job["tool_id"], _hc_bucket(job["headcount"]))
             groups.setdefault(key, []).append(job)
 
+        # Merge HC buckets for tools that have urgent jobs (past-due or
+        # higher).  Splitting by HC bucket can strand a past-due job
+        # behind a sibling batch of the same tool on the same machine.
+        tool_jobs: dict[str, list[dict]] = {}
+        for (tool_id, _bucket), g_jobs in groups.items():
+            tool_jobs.setdefault(tool_id, []).extend(g_jobs)
+        merge_tools = {
+            tid for tid, tj in tool_jobs.items()
+            if any(j.get("priority_class", 3) <= 2 for j in tj)
+            and len({_hc_bucket(j["headcount"]) for j in tj}) > 1
+        }
+        if merge_tools:
+            merged: dict[tuple[str, str], list[dict]] = {}
+            for (tool_id, bucket), g_jobs in groups.items():
+                key = (tool_id, "merged") if tool_id in merge_tools else (tool_id, bucket)
+                merged.setdefault(key, []).extend(g_jobs)
+            groups = merged
+
         for (tool_id, _bucket), group_jobs in groups.items():
             # Sort within batch
             group_jobs.sort(key=lambda j: (
