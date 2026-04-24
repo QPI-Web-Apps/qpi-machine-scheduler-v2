@@ -13,6 +13,14 @@ from .calendar_utils import (
     which_shift,
 )
 from .models import MACHINE_BY_ID
+
+
+def _snap_to_minute(dt: datetime) -> datetime:
+    """Truncate sub-minute precision.  The solver works in integer
+    staffed-minutes; fractional-hour arithmetic in add_staffed_hours
+    introduces sub-second drift that causes phantom crew overlaps
+    at batch boundaries."""
+    return dt.replace(second=0, microsecond=0)
 from .scheduler_io import SchedulerConfig, load_jobs_from_excel
 from .solver import (
     SolverResult,
@@ -264,10 +272,10 @@ def _assemble_schedule(
         #   • Otherwise, fill the whole gap with NOT_RUNNING.
         if m_batches and m_batches[0].start_minute > 0:
             first_sb = m_batches[0]
-            first_start = _staffed_minute_to_datetime(
+            first_start = _snap_to_minute(_staffed_minute_to_datetime(
                 first_sb.start_minute, schedule_start, spd
-            )
-            aligned_start = align_to_working_time(schedule_start, spd)
+            ))
+            aligned_start = _snap_to_minute(align_to_working_time(schedule_start, spd))
             gap_hours = staffed_hours_between(aligned_start, first_start, spd)
 
             needs_upfront_co = (
@@ -284,9 +292,9 @@ def _assemble_schedule(
                 else:
                     machine_co_min = round(machine_co_hours * 60)
                     co_start_minute = max(0, first_sb.start_minute - machine_co_min)
-                co_start_dt = _staffed_minute_to_datetime(
+                co_start_dt = _snap_to_minute(_staffed_minute_to_datetime(
                     co_start_minute, schedule_start, spd
-                )
+                ))
 
                 # NOT_RUNNING fills the leading portion (if any) before the CO.
                 pre_co_gap_hours = staffed_hours_between(
@@ -331,22 +339,21 @@ def _assemble_schedule(
 
         for sb in m_batches:
             batch = sb.batch
-            batch_start_dt = _staffed_minute_to_datetime(
+            batch_start_dt = _snap_to_minute(_staffed_minute_to_datetime(
                 sb.start_minute, schedule_start, spd
-            )
+            ))
 
             # Insert changeover before this batch if tool changed
             if prev_tool is not None and prev_tool != batch.tool_id and spec.has_changeovers:
                 # Use solver's changeover start if available, else fall back
                 if sb.co_start_minute is not None:
-                    co_start = _staffed_minute_to_datetime(
+                    co_start = _snap_to_minute(_staffed_minute_to_datetime(
                         sb.co_start_minute, schedule_start, spd
-                    )
+                    ))
                 else:
                     co_start = prev_end if prev_end else batch_start_dt
                 co_hours = spec.changeover_hours
-                # Changeover consumes staffed time (skips non-working periods)
-                co_end = add_staffed_hours(co_start, co_hours, spd)
+                co_end = _snap_to_minute(add_staffed_hours(co_start, co_hours, spd))
 
                 # Snap changeover end to batch start when the difference is
                 # just rounding noise (solver uses integer minutes, assembly
@@ -387,8 +394,8 @@ def _assemble_schedule(
             # Expand batch into individual JOB entries
             cursor = batch_start_dt
             for job in batch.jobs:
-                job_start = align_to_working_time(cursor, spd)
-                job_end = add_staffed_hours(job_start, job["run_hours"], spd)
+                job_start = _snap_to_minute(align_to_working_time(cursor, spd))
+                job_end = _snap_to_minute(add_staffed_hours(job_start, job["run_hours"], spd))
 
                 entries.append(ScheduleEntry(
                     machine_id=machine_id,
