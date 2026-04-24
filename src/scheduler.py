@@ -705,6 +705,22 @@ def _collect_crew_events(
                     )
                     break
 
+    # ── Fallback: guarantee every job start has a CREW_POOL source ──
+    #
+    # Even if other freed events are feasible, the optimizer might
+    # assign them to competing targets. A dedicated CREW_POOL per
+    # target ensures no machine starts work without a crew source.
+    seeded: set[tuple[str, datetime]] = set()
+    for ft, fm, _, reason, _ in freed_events:
+        if fm == "CREW_POOL":
+            seeded.add((reason, ft))
+    for js in job_starts:
+        key = ("shift_start", js.start)
+        if key not in seeded:
+            freed_events.append(
+                (js.start, "CREW_POOL", js.headcount or 11.0, "shift_start", None)
+            )
+
     return freed_events, job_starts
 
 
@@ -854,10 +870,23 @@ def _optimize_crew_cpsat(
 
     # ── Unassigned penalty ──────────────────────────────────────
     UNASSIGNED_PENALTY = 60
+    UNMATCHED_TARGET_PENALTY = 500
     total_assigned = sum(v for vl in source_vars.values() for v in vl)
 
+    # Penalize targets that receive no source — a machine starting
+    # work without crew is worse than a freed crew going idle.
+    target_covered: list = []
+    for j in range(n_targets):
+        tvars = target_vars.get(j, [])
+        if tvars:
+            target_covered.append(sum(tvars))
+        else:
+            target_covered.append(0)
+    total_targets_covered = sum(target_covered)
+
     # ── Objective ───────────────────────────────────────────────
-    obj = UNASSIGNED_PENALTY * (n_sources - total_assigned)
+    obj = (UNASSIGNED_PENALTY * (n_sources - total_assigned)
+           + UNMATCHED_TARGET_PENALTY * (n_targets - total_targets_covered))
     if pp_terms:
         obj += PING_PONG_PENALTY * sum(pp_terms)
     if idle_terms:
