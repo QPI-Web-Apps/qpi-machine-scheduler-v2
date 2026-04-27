@@ -964,9 +964,16 @@ function restoreConfig(config) {
   if (config.priority_boost !== undefined) document.getElementById('prioBoost').checked = config.priority_boost;
   if (config.total_crew !== undefined) document.getElementById('totalCrew').value = config.total_crew;
   if (config.shift_config && typeof config.shift_config === 'object') {
-    shiftConfig = config.shift_config;
     initShiftGrid();
-    shiftConfig = config.shift_config;
+    Object.entries(config.shift_config).forEach(([mid, dates]) => {
+      if (shiftConfig[mid] && typeof dates === 'object') {
+        Object.entries(dates).forEach(([dateKey, shifts]) => {
+          if (dateKey in shiftConfig[mid]) {
+            shiftConfig[mid][dateKey] = shifts;
+          }
+        });
+      }
+    });
     renderShiftGrid();
   }
   if (config.initial_tools) {

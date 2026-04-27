@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -685,6 +685,49 @@ def _collect_crew_events(
         # leaving a gap where the crew is idle and can jump elsewhere.
         freed_events.append((prev_job.end, co.machine_id, hc, "changeover", e))
 
+    # ── Same-machine HC transitions (job→job, with optional tool swap) ──
+    #
+    # When consecutive JOBs on a machine have different headcounts (e.g.
+    # 11 → 14, or 11 → 5), the surplus crew can jump elsewhere (drop)
+    # and the deficit must be filled from another source (bump).  Without
+    # this, the post-hoc bridge silently assumes crew morphs to fit the
+    # next job, producing schedules where no crew flow is recorded.
+    HC_DELTA_TOLERANCE = 0.5
+    for machine_id, m_entries in by_machine.items():
+        for i, e in enumerate(m_entries):
+            if e.entry_type != "JOB":
+                continue
+            # Find previous JOB on same machine, allowing TOOL_SWAP between.
+            # CHANGEOVER or NOT_RUNNING break the continuous-crew chain.
+            prev_job = None
+            for k in range(i - 1, -1, -1):
+                pe = m_entries[k]
+                if pe.entry_type == "JOB":
+                    prev_job = pe
+                    break
+                if pe.entry_type == "TOOL_SWAP":
+                    continue
+                break
+            if prev_job is None:
+                continue
+            prev_hc = prev_job.headcount or 0
+            cur_hc = e.headcount or 0
+            delta = cur_hc - prev_hc
+            if delta < -HC_DELTA_TOLERANCE:
+                # HC drop: surplus crew physically free when the previous
+                # job ends — even if a tool swap follows, only the smaller
+                # next-batch HC is needed to run it.
+                freed_events.append(
+                    (prev_job.end, machine_id, -delta, "hc_drop", prev_job)
+                )
+            elif delta > HC_DELTA_TOLERANCE:
+                # HC bump: synthetic target carrying only the delta.  The
+                # link back to the real entry lets _apply_assignments
+                # propagate crew_from to the user-visible job entry.
+                synth = replace(e, headcount=delta)
+                synth._real_target = e  # type: ignore[attr-defined]
+                job_starts.append(synth)
+
     # ── Seed crews at shift boundaries ──────────────────────────
     #
     # At each shift start (06:30, 14:30) fresh crews arrive. Jobs that
@@ -762,6 +805,12 @@ def _apply_assignments(
         if source_entry:
             source_entry.crew_to = target.machine_id
         target.crew_from = freed_machine
+        # HC-bump synthetic targets carry a link back to the real entry —
+        # propagate crew_from there so the user-visible job records the
+        # source of the delta crew.
+        real_target = getattr(target, "_real_target", None)
+        if real_target is not None and real_target.crew_from is None:
+            real_target.crew_from = freed_machine
 
         movements.append(CrewMovement(
             time=target.start,
@@ -868,10 +917,27 @@ def _optimize_crew_cpsat(
             if hc_diff > 0:
                 hc_terms.append(hc_diff * x[(i, j)])
 
-    # ── Unassigned penalty ──────────────────────────────────────
+    # ── Unassigned / POOL-usage penalties ──────────────────────
     UNASSIGNED_PENALTY = 60
     UNMATCHED_TARGET_PENALTY = 500
-    total_assigned = sum(v for vl in source_vars.values() for v in vl)
+    POOL_USAGE_PENALTY = 100  # using fresh CREW_POOL costs more than a real handoff
+
+    # POOL is unlimited fresh crew, so unassigned POOL events should not
+    # contribute to UNASSIGNED_PENALTY (otherwise POOL→target wins over
+    # real handoffs because dropping POOL still costs 60).  Instead, charge
+    # POOL_USAGE_PENALTY each time POOL is assigned to a target.  This
+    # makes real freed crew strictly preferred whenever feasible, while
+    # still letting POOL cover otherwise-uncovered targets.
+    real_source_idx = [
+        i for i in range(n_sources) if freed_events[i][1] != "CREW_POOL"
+    ]
+    pool_source_idx = [
+        i for i in range(n_sources) if freed_events[i][1] == "CREW_POOL"
+    ]
+    real_assigned = sum(v for i in real_source_idx for v in source_vars[i])
+    pool_usage_terms = [
+        x[(i, j)] for i in pool_source_idx for j in feasible[i]
+    ]
 
     # Penalize targets that receive no source — a machine starting
     # work without crew is worse than a freed crew going idle.
@@ -885,8 +951,10 @@ def _optimize_crew_cpsat(
     total_targets_covered = sum(target_covered)
 
     # ── Objective ───────────────────────────────────────────────
-    obj = (UNASSIGNED_PENALTY * (n_sources - total_assigned)
+    obj = (UNASSIGNED_PENALTY * (len(real_source_idx) - real_assigned)
            + UNMATCHED_TARGET_PENALTY * (n_targets - total_targets_covered))
+    if pool_usage_terms:
+        obj += POOL_USAGE_PENALTY * sum(pool_usage_terms)
     if pp_terms:
         obj += PING_PONG_PENALTY * sum(pp_terms)
     if idle_terms:
@@ -923,17 +991,20 @@ def _greedy_assignment(
     window = timedelta(hours=3)
     max_window_sec = window.total_seconds()
 
-    def _score(freed_time, hc, target):
+    def _score(freed_time, freed_machine, hc, target):
         time_score = abs((target.start - freed_time).total_seconds()) / max_window_sec
         target_hc = target.headcount or hc
         hc_gap = abs(hc - target_hc) / max(hc, 1)
-        return time_score + hc_gap * 0.1
+        # Strongly disprefer CREW_POOL when a real freed source is feasible
+        # for the same target.  POOL is fallback-of-last-resort.
+        pool_penalty = 1.0 if freed_machine == "CREW_POOL" else 0.0
+        return time_score + hc_gap * 0.1 + pool_penalty
 
     # Build scored pairings
     pairings: list[tuple[float, int, int]] = []  # (score, freed_idx, target_idx)
     for i, (freed_time, freed_machine, hc, reason, source_entry) in enumerate(freed_events):
         for j in feasible[i]:
-            pairings.append((_score(freed_time, hc, job_starts[j]), i, j))
+            pairings.append((_score(freed_time, freed_machine, hc, job_starts[j]), i, j))
 
     pairings.sort(key=lambda p: p[0])
 
