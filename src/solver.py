@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -468,6 +469,12 @@ def solve_schedule(
     # co_start_vars[batch_id] = [(arc_lit, co_start_var), ...]
     co_start_vars: dict[int, list[tuple[cp_model.IntVar, cp_model.IntVar]]] = {}
 
+    # Per-batch arc literal capture for crew-jump model (built later)
+    first_lit_for: dict[int, cp_model.IntVar] = {}
+    last_lit_for: dict[int, cp_model.IntVar] = {}
+    outgoing_co_lits: dict[int, list[cp_model.IntVar]] = {}
+    incoming_co_lits: dict[int, list[cp_model.IntVar]] = {}
+
     for machine_id, m_batches in machine_batches.items():
         if not m_batches:
             continue
@@ -486,6 +493,7 @@ def solve_schedule(
             # Arc: depot (0) → batch i+1 — batch i is first on this machine
             first_lit = model.new_bool_var(f"first_{machine_id}_{bi.batch_id}")
             arcs.append((0, i + 1, first_lit))
+            first_lit_for[bi.batch_id] = first_lit
 
             # Force in-progress batch to be first
             if bi.has_in_progress:
@@ -514,6 +522,7 @@ def solve_schedule(
             # Arc: batch i+1 → depot (0) — batch i is last
             last_lit = model.new_bool_var(f"last_{machine_id}_{bi.batch_id}")
             arcs.append((i + 1, 0, last_lit))
+            last_lit_for[bi.batch_id] = last_lit
 
             # Arcs: batch i → batch j (i immediately precedes j)
             for j in range(n):
@@ -549,6 +558,9 @@ def solve_schedule(
                     co_arcs.setdefault(machine_id, {})[(i, j)] = lit
                     # Track: CO before batch j when arc i→j is active
                     co_start_vars.setdefault(bj.batch_id, []).append((lit, co_start))
+                    # Tool-change arcs free crew on bi and require crew on bj
+                    outgoing_co_lits.setdefault(bi.batch_id, []).append(lit)
+                    incoming_co_lits.setdefault(bj.batch_id, []).append(lit)
                 else:
                     model.add(
                         starts[bj.batch_id] >= ends[bi.batch_id]
@@ -761,6 +773,147 @@ def solve_schedule(
         # down can cause the solver to over-schedule concurrent crew.
         hc_demands = [max(1, int(math.ceil(b.dominant_headcount))) for b in batches]
         model.add_cumulative(all_intervals, hc_demands, cfg.total_crew)
+
+    # ── Crew jump ±2 tool-distance HARD constraint ───────────────
+    #
+    # When a maintenance changeover or end-of-work frees an operator
+    # crew on machine A and another batch on machine B needs that crew,
+    # the two batches' tool IDs must differ by at most 2 (numeric).
+    # Pairs violating this rule are not modelled at all → the solver
+    # must reorder / re-time batches so every needs-crew batch is
+    # covered by either (a) a feasible ±2 jump donor or (b) a shift-
+    # start CREW_POOL alignment.
+    #
+    # Donor eligibility: maintenance machine (has_changeovers and not
+    #   self-service); batches whose successor arc is a tool-change OR
+    #   that are last on their machine.
+    # Recipient eligibility: any non-self-service machine (incl. M20);
+    #   batches that are first on their machine OR follow a tool-change.
+    # Numeric tool: first integer found in tool_id ("QPI123" → 123,
+    #   "99999" → 99999); non-numeric → not jump-compatible.
+
+    JUMP_TOL_MIN = 30           # crew may arrive up to 30 min before recipient start
+    JUMP_WINDOW_MIN = 180       # crew may arrive up to 3 h after freed time
+    SHIFT_BOUNDARY_TOL = 30     # tolerance for shift-start CREW_POOL alignment
+    SHIFT_LEN = 480             # staffed minutes per shift (8 h)
+
+    def _tool_numeric(tool_id: str) -> Optional[int]:
+        if not tool_id:
+            return None
+        m = re.search(r"\d+", str(tool_id))
+        return int(m.group()) if m else None
+
+    batch_tool_num: dict[int, Optional[int]] = {
+        b.batch_id: _tool_numeric(b.tool_id) for b in batches
+    }
+
+    # Build frees/needs reified booleans per batch (skip self-service)
+    frees_lit: dict[int, cp_model.IntVar] = {}
+    needs_lit: dict[int, cp_model.IntVar] = {}
+
+    for b in batches:
+        spec = MACHINE_BY_ID[b.machine_id]
+        if spec.self_service_changeover:
+            continue
+
+        # Donor only if machine has maintenance changeovers (excludes M20)
+        if spec.has_changeovers:
+            out_lits = list(outgoing_co_lits.get(b.batch_id, []))
+            ll = last_lit_for.get(b.batch_id)
+            if ll is not None:
+                out_lits.append(ll)
+            if out_lits:
+                fl = model.new_bool_var(f"frees_crew_{b.batch_id}")
+                model.add_max_equality(fl, out_lits)
+                frees_lit[b.batch_id] = fl
+
+        # Recipient: any non-self-service machine (incl. machine 20)
+        in_lits = list(incoming_co_lits.get(b.batch_id, []))
+        fl0 = first_lit_for.get(b.batch_id)
+        if fl0 is not None:
+            in_lits.append(fl0)
+        if in_lits:
+            nl = model.new_bool_var(f"needs_crew_{b.batch_id}")
+            model.add_max_equality(nl, in_lits)
+            needs_lit[b.batch_id] = nl
+
+    # Build jump-pair vars cross-machine, pre-filtered by ±2 numeric tool
+    jump_vars: dict[tuple[int, int], cp_model.IntVar] = {}
+    jumps_from: dict[int, list[cp_model.IntVar]] = {}
+    jumps_to: dict[int, list[cp_model.IntVar]] = {}
+
+    for bi in batches:
+        if bi.batch_id not in frees_lit:
+            continue
+        ti = batch_tool_num[bi.batch_id]
+        if ti is None:
+            continue
+        for bj in batches:
+            if bi.machine_id == bj.machine_id:
+                continue
+            if bj.batch_id not in needs_lit:
+                continue
+            tj = batch_tool_num[bj.batch_id]
+            if tj is None:
+                continue
+            if abs(ti - tj) > 2:
+                continue
+            x = model.new_bool_var(f"jump_{bi.batch_id}_to_{bj.batch_id}")
+            jump_vars[(bi.batch_id, bj.batch_id)] = x
+            jumps_from.setdefault(bi.batch_id, []).append(x)
+            jumps_to.setdefault(bj.batch_id, []).append(x)
+
+            # Active jump implies donor frees and recipient needs
+            model.add_implication(x, frees_lit[bi.batch_id])
+            model.add_implication(x, needs_lit[bj.batch_id])
+
+            # Time window: ends[i] - tol <= starts[j] <= ends[i] + window
+            model.add(
+                starts[bj.batch_id] >= ends[bi.batch_id] - JUMP_TOL_MIN
+            ).only_enforce_if(x)
+            model.add(
+                starts[bj.batch_id] <= ends[bi.batch_id] + JUMP_WINDOW_MIN
+            ).only_enforce_if(x)
+
+    # At-most-one donor per recipient and at-most-one recipient per donor
+    for xs in jumps_from.values():
+        if len(xs) > 1:
+            model.add(sum(xs) <= 1)
+    for xs in jumps_to.values():
+        if len(xs) > 1:
+            model.add(sum(xs) <= 1)
+
+    # Recipient coverage: needs_lit[j] ⇒ at_shift_start[j] OR sum(jumps_to[j]) ≥ 1
+    boundaries = list(range(0, horizon + 1, SHIFT_LEN))
+
+    for b in batches:
+        if b.batch_id not in needs_lit:
+            continue
+
+        # at_shift_start[j]: solver sets True iff starts[j] is within
+        # ±SHIFT_BOUNDARY_TOL of some shift boundary (multiples of 480
+        # in the staffed-minute timeline).
+        boundary_lits: list[cp_model.IntVar] = []
+        for k in boundaries:
+            bl = model.new_bool_var(f"at_sb_{b.batch_id}_{k}")
+            model.add(starts[b.batch_id] >= k - SHIFT_BOUNDARY_TOL).only_enforce_if(bl)
+            model.add(starts[b.batch_id] <= k + SHIFT_BOUNDARY_TOL).only_enforce_if(bl)
+            boundary_lits.append(bl)
+
+        at_sb = model.new_bool_var(f"at_shift_start_{b.batch_id}")
+        if boundary_lits:
+            model.add_max_equality(at_sb, boundary_lits)
+        else:
+            model.add(at_sb == 0)
+
+        coverage_terms = jumps_to.get(b.batch_id, [])
+        if coverage_terms:
+            model.add(
+                at_sb + sum(coverage_terms) >= 1
+            ).only_enforce_if(needs_lit[b.batch_id])
+        else:
+            # No feasible jump donor exists → must align with shift start
+            model.add(at_sb >= 1).only_enforce_if(needs_lit[b.batch_id])
 
     # ── Objective ────────────────────────────────────────────────
     #

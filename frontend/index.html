@@ -39,14 +39,19 @@
       <input type="number" id="maxConcurrent" value="5" min="1" max="9">
     </div>
     <div class="control-group">
+      <label title="Max total headcount across concurrent jobs (0 = unlimited)">Crew Cap</label>
+      <input type="number" id="totalCrew" value="0" min="0" max="200">
+    </div>
+    <div class="control-group">
       <label>Include</label>
       <label class="ticket-toggle"><input type="checkbox" id="inclYellow"><span class="ticket-chip yellow">Yellow</span></label>
       <label class="ticket-toggle"><input type="checkbox" id="inclPink"><span class="ticket-chip pink">Pink</span></label>
       <label class="ticket-toggle"><input type="checkbox" id="inclWhite"><span class="ticket-chip white">White</span></label>
     </div>
     <label class="ticket-toggle"><input type="checkbox" id="prioBoost" checked><span class="ticket-chip boost">P+ Boost</span></label>
+    <label class="ticket-toggle"><input type="checkbox" id="crewGroupsEnabled" onchange="onCrewGroupsToggle()"><span class="ticket-chip">Crew Groups</span></label>
     <button class="day-btn" onclick="toggleShiftPanel()">Shifts</button>
-    <button class="day-btn" onclick="toggleMachinePanel()">Machines</button>
+    <button class="day-btn" id="crewGroupsBtn" onclick="toggleMachinePanel()" style="display:none;">Machines</button>
   </div>
 </header>
 
@@ -451,7 +456,13 @@ function renderGroupGrid() {
   document.getElementById('groupGrid').innerHTML = html;
 }
 
+function isCrewGroupsEnabled() {
+  const el = document.getElementById('crewGroupsEnabled');
+  return el ? el.checked : false;
+}
+
 function getMachineGroups() {
+  if (!isCrewGroupsEnabled()) return {};
   const groups = {};
   GROUP_NAMES.forEach(g => {
     const machines = MACHINE_ORDER.filter(mid => HARDCODED_GROUPS[mid] === g);
@@ -460,6 +471,15 @@ function getMachineGroups() {
     }
   });
   return groups;
+}
+
+function onCrewGroupsToggle() {
+  const enabled = isCrewGroupsEnabled();
+  const btn = document.getElementById('crewGroupsBtn');
+  if (btn) btn.style.display = enabled ? '' : 'none';
+  if (!enabled) {
+    document.getElementById('machineTogglePanel').classList.add('collapsed');
+  }
 }
 
 function toggleMachinePanel() {
@@ -525,6 +545,7 @@ async function runSchedule() {
   formData.append('reference_date', document.getElementById('refDate').value);
   formData.append('reference_time', document.getElementById('refTime').value);
   formData.append('max_concurrent', document.getElementById('maxConcurrent').value);
+  formData.append('total_crew', document.getElementById('totalCrew').value);
   formData.append('shift_config', JSON.stringify(shiftConfig));
   formData.append('include_yellow', document.getElementById('inclYellow').checked);
   formData.append('include_pink', document.getElementById('inclPink').checked);
@@ -602,6 +623,7 @@ function saveScheduleJson() {
       reference_date: document.getElementById('refDate').value,
       reference_time: document.getElementById('refTime').value,
       max_concurrent: document.getElementById('maxConcurrent').value,
+      total_crew: document.getElementById('totalCrew').value,
       include_yellow: document.getElementById('inclYellow').checked,
       include_pink: document.getElementById('inclPink').checked,
       include_white: document.getElementById('inclWhite').checked,
@@ -611,7 +633,8 @@ function saveScheduleJson() {
       disabled_machines: getDisabledMachines(),
       initial_tools: getInitialTools(),
       machine_groups: getMachineGroups(),
-      group_max_concurrent: groupMaxConcurrent
+      group_max_concurrent: groupMaxConcurrent,
+      crew_groups_enabled: isCrewGroupsEnabled()
     },
     scheduleData: scheduleData
   };
@@ -894,6 +917,7 @@ async function loadRunIntoUI(runId) {
       reference_date: startParts[0] || '',
       reference_time: startParts[1] ? startParts[1].substring(0, 5) : '06:30',
       max_concurrent: cfg.max_concurrent || 5,
+      total_crew: cfg.total_crew || 0,
       include_yellow: cfg.include_yellow || false,
       include_pink: cfg.include_pink || false,
       include_white: cfg.include_white || false,
@@ -943,6 +967,7 @@ function restoreConfig(config) {
   if (config.reference_date) document.getElementById('refDate').value = config.reference_date;
   if (config.reference_time) document.getElementById('refTime').value = config.reference_time;
   if (config.max_concurrent) document.getElementById('maxConcurrent').value = config.max_concurrent;
+  if (config.total_crew !== undefined) document.getElementById('totalCrew').value = config.total_crew;
   if (config.include_yellow !== undefined) document.getElementById('inclYellow').checked = config.include_yellow;
   if (config.include_pink !== undefined) document.getElementById('inclPink').checked = config.include_pink;
   if (config.include_white !== undefined) document.getElementById('inclWhite').checked = config.include_white;
@@ -962,6 +987,10 @@ function restoreConfig(config) {
   if (config.group_max_concurrent) {
     Object.assign(groupMaxConcurrent, config.group_max_concurrent);
     renderGroupGrid();
+  }
+  if (config.crew_groups_enabled !== undefined) {
+    document.getElementById('crewGroupsEnabled').checked = !!config.crew_groups_enabled;
+    onCrewGroupsToggle();
   }
 }
 
