@@ -277,6 +277,7 @@ async def create_schedule(
     disabled_machines: str = Form(default=""),
     hc_penalty_weight: float = Form(default=30),
     total_crew: int = Form(default=0),
+    crew_cap_schedule: str = Form(default=""),
     machine_groups: str = Form(default=""),
 ):
     """Upload Excel, generate schedule, return JSON."""
@@ -298,6 +299,30 @@ async def create_schedule(
         except json.JSONDecodeError:
             pass
 
+    # Parse per-day per-shift crew cap schedule. JSON shape:
+    #   {"YYYY-MM-DD": {"1": cap, "2": cap, "3": cap}, ...}
+    parsed_cap_schedule: dict[str, dict[int, int]] = {}
+    if crew_cap_schedule:
+        try:
+            raw = json.loads(crew_cap_schedule)
+            if isinstance(raw, dict):
+                for date_key, day_caps in raw.items():
+                    if not isinstance(day_caps, dict):
+                        continue
+                    inner: dict[int, int] = {}
+                    for sk, cv in day_caps.items():
+                        try:
+                            s = int(sk)
+                            cap = int(cv)
+                            if 1 <= s <= 3 and cap >= 0:
+                                inner[s] = cap
+                        except (TypeError, ValueError):
+                            continue
+                    if inner:
+                        parsed_cap_schedule[str(date_key)] = inner
+        except json.JSONDecodeError:
+            pass
+
     cfg = SchedulerConfig(
         schedule_start=schedule_start,
         include_yellow=include_yellow,
@@ -308,6 +333,7 @@ async def create_schedule(
         disabled_machines=disabled_machines_list,
         hc_penalty_weight=hc_penalty_weight,
         total_crew=total_crew,
+        crew_cap_schedule=parsed_cap_schedule,
     )
 
     # Parse per-machine-per-day shift config if provided

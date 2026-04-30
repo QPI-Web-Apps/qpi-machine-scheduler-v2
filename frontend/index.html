@@ -39,7 +39,7 @@
       <input type="number" id="maxConcurrent" value="5" min="1" max="9">
     </div>
     <div class="control-group">
-      <label title="Max total headcount across concurrent jobs (0 = unlimited)">Crew Cap</label>
+      <label title="Max total headcount across concurrent jobs (0 = unlimited; used as fallback when a per-shift cap is blank)">Crew Cap</label>
       <input type="number" id="totalCrew" value="0" min="0" max="200">
     </div>
     <div class="control-group">
@@ -102,6 +102,10 @@
     </div>
   </div>
   <div class="shift-grid" id="shiftGrid"></div>
+  <div class="crew-cap-section" id="crewCapSection" title="Crew cap per shift, per day. Blank = fall back to global Crew Cap. Only values stricter than global add a constraint.">
+    <div class="crew-cap-label">Crew cap per shift / day</div>
+    <div class="crew-cap-grid" id="crewCapGrid"></div>
+  </div>
   <div class="initial-tools" id="initialToolsRow">
     <span class="it-label">Last tool on machine</span>
     <div class="it-inputs" id="itInputs"></div>
@@ -260,6 +264,10 @@ const DAY_HOURS = SHIFT2_END_H - SHIFT1_START_H; // 16h total
 let shiftConfig = {};
 let shiftGridDays = []; // 14 Date objects for the grid columns
 
+// Crew cap schedule: { "YYYY-MM-DD": { 1: cap, 2: cap, 3: cap }, ... }
+// Only entries explicitly set by user are stored. Blank inputs are absent.
+let crewCapSchedule = {};
+
 // ── File handling ──────────────────────────────────────
 document.getElementById('fileInput').addEventListener('change', (e) => {
   selectedFile = e.target.files[0];
@@ -299,6 +307,50 @@ function initShiftGrid() {
   });
 
   renderShiftGrid();
+  renderCrewCapGrid();
+}
+
+function renderCrewCapGrid() {
+  const grid = document.getElementById('crewCapGrid');
+  if (!grid) return;
+  const dows = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  let html = '<div class="cc-corner">Cap</div>';
+  shiftGridDays.forEach(d => {
+    const dow = d.getDay();
+    const isWe = dow === 0 || dow === 6;
+    html += `<div class="cc-corner${isWe ? ' weekend' : ''}">`;
+    html += `<div class="sg-dow">${dows[dow]}</div>`;
+    html += `<div class="sg-date">${d.getMonth()+1}/${d.getDate()}</div>`;
+    html += '</div>';
+  });
+  for (let s = 1; s <= 3; s++) {
+    html += `<div class="cc-row-header">S${s}</div>`;
+    shiftGridDays.forEach(d => {
+      const key = localDateStr(d);
+      const dow = d.getDay();
+      const isWe = dow === 0 || dow === 6;
+      const val = (crewCapSchedule[key] && crewCapSchedule[key][s] !== undefined && crewCapSchedule[key][s] !== null)
+        ? crewCapSchedule[key][s] : '';
+      html += `<div class="cc-cell${isWe ? ' weekend' : ''}">`;
+      html += `<input type="number" class="cc-input" min="0" max="200" value="${val}" data-date="${key}" data-shift="${s}" oninput="updateCrewCap(this)" placeholder="—">`;
+      html += '</div>';
+    });
+  }
+  grid.innerHTML = html;
+}
+
+function updateCrewCap(el) {
+  const date = el.dataset.date;
+  const shift = parseInt(el.dataset.shift, 10);
+  const raw = el.value;
+  if (!crewCapSchedule[date]) crewCapSchedule[date] = {};
+  if (raw === '' || raw === null) {
+    delete crewCapSchedule[date][shift];
+    if (Object.keys(crewCapSchedule[date]).length === 0) delete crewCapSchedule[date];
+  } else {
+    const n = parseInt(raw, 10);
+    if (Number.isFinite(n) && n >= 0) crewCapSchedule[date][shift] = n;
+  }
 }
 
 function renderShiftGrid() {
@@ -490,6 +542,19 @@ function getDisabledMachines() {
   return [];
 }
 
+function getCrewCapSchedule() {
+  // Return clean copy, dropping any empty per-day objects
+  const out = {};
+  for (const [date, shifts] of Object.entries(crewCapSchedule || {})) {
+    const inner = {};
+    for (const [s, v] of Object.entries(shifts || {})) {
+      if (v !== '' && v !== null && v !== undefined) inner[String(s)] = v;
+    }
+    if (Object.keys(inner).length > 0) out[date] = inner;
+  }
+  return out;
+}
+
 // Init grid on page load
 initShiftGrid();
 renderInitialTools();
@@ -546,6 +611,7 @@ async function runSchedule() {
   formData.append('reference_time', document.getElementById('refTime').value);
   formData.append('max_concurrent', document.getElementById('maxConcurrent').value);
   formData.append('total_crew', document.getElementById('totalCrew').value);
+  formData.append('crew_cap_schedule', JSON.stringify(getCrewCapSchedule()));
   formData.append('shift_config', JSON.stringify(shiftConfig));
   formData.append('include_yellow', document.getElementById('inclYellow').checked);
   formData.append('include_pink', document.getElementById('inclPink').checked);
@@ -624,6 +690,7 @@ function saveScheduleJson() {
       reference_time: document.getElementById('refTime').value,
       max_concurrent: document.getElementById('maxConcurrent').value,
       total_crew: document.getElementById('totalCrew').value,
+      crew_cap_schedule: getCrewCapSchedule(),
       include_yellow: document.getElementById('inclYellow').checked,
       include_pink: document.getElementById('inclPink').checked,
       include_white: document.getElementById('inclWhite').checked,
@@ -918,6 +985,7 @@ async function loadRunIntoUI(runId) {
       reference_time: startParts[1] ? startParts[1].substring(0, 5) : '06:30',
       max_concurrent: cfg.max_concurrent || 5,
       total_crew: cfg.total_crew || 0,
+      crew_cap_schedule: cfg.crew_cap_schedule || {},
       include_yellow: cfg.include_yellow || false,
       include_pink: cfg.include_pink || false,
       include_white: cfg.include_white || false,
@@ -968,6 +1036,20 @@ function restoreConfig(config) {
   if (config.reference_time) document.getElementById('refTime').value = config.reference_time;
   if (config.max_concurrent) document.getElementById('maxConcurrent').value = config.max_concurrent;
   if (config.total_crew !== undefined) document.getElementById('totalCrew').value = config.total_crew;
+  // Restore crew cap schedule (per-day per-shift)
+  crewCapSchedule = {};
+  if (config.crew_cap_schedule && typeof config.crew_cap_schedule === 'object') {
+    for (const [date, shifts] of Object.entries(config.crew_cap_schedule)) {
+      if (!shifts || typeof shifts !== 'object') continue;
+      const inner = {};
+      for (const [s, v] of Object.entries(shifts)) {
+        const n = (v === '' || v === null) ? null : parseInt(v, 10);
+        if (Number.isFinite(n) && n >= 0) inner[String(s)] = n;
+      }
+      if (Object.keys(inner).length > 0) crewCapSchedule[date] = inner;
+    }
+  }
+  renderCrewCapGrid();
   if (config.include_yellow !== undefined) document.getElementById('inclYellow').checked = config.include_yellow;
   if (config.include_pink !== undefined) document.getElementById('inclPink').checked = config.include_pink;
   if (config.include_white !== undefined) document.getElementById('inclWhite').checked = config.include_white;

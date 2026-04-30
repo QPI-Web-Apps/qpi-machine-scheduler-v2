@@ -254,3 +254,60 @@ def datetime_to_staffed_minute(
         return 0
     hours = staffed_hours_between(schedule_start, dt, shifts_per_day)
     return round(hours * 60)
+
+
+def iter_shift_windows_staffed_minutes(
+    schedule_start: datetime,
+    horizon_minutes: int,
+    shifts_per_day: ShiftConfig,
+) -> list[tuple[int, str, int, int]]:
+    """Walk the staffed-minute timeline from schedule_start and emit
+    (shift_id, date_iso, window_start_min, window_end_min) for each
+    contiguous active shift segment, until cumulative staffed minutes
+    reach horizon_minutes.
+
+    date_iso is the calendar date the shift is attributed to. Shift 3
+    (which crosses midnight) is attributed to the evening date.
+
+    Windows are contiguous in staffed-minute space (gaps between
+    calendar shifts are skipped — staffed minutes only advance during
+    active shifts).
+    """
+    if horizon_minutes <= 0:
+        return []
+
+    windows: list[tuple[int, str, int, int]] = []
+    cursor_min = 0
+    d = schedule_start.date()
+    aligned = align_to_working_time(schedule_start, shifts_per_day)
+    if aligned is _DONE:
+        return []
+
+    max_days = 400
+    first_day = True
+    for _ in range(max_days):
+        segs = _segments_for_day(d, shifts_per_day)
+        active = _resolve_shifts(d, shifts_per_day)
+        for shift_num, (seg_start, seg_end) in zip(active, segs):
+            if first_day:
+                if seg_end <= schedule_start:
+                    continue
+                effective_start = max(seg_start, schedule_start)
+            else:
+                effective_start = seg_start
+            seg_minutes = int(round((seg_end - effective_start).total_seconds() / 60))
+            if seg_minutes <= 0:
+                continue
+            w_start = cursor_min
+            w_end = cursor_min + seg_minutes
+            if w_start >= horizon_minutes:
+                return windows
+            w_end_clipped = min(w_end, horizon_minutes)
+            windows.append((shift_num, d.isoformat(), w_start, w_end_clipped))
+            cursor_min = w_end
+            if cursor_min >= horizon_minutes:
+                return windows
+        first_day = False
+        d = _next_active_day(d, shifts_per_day)
+
+    return windows

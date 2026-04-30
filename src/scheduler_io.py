@@ -48,6 +48,11 @@ class SchedulerConfig:
     minimize_late: bool = False
     hc_penalty_weight: float = 30  # minutes-equivalent cost per HC unit of change
     total_crew: int = 0  # max total headcount across concurrent jobs (0 = unlimited)
+    # Per-day per-shift crew cap override.
+    # Schema: {"YYYY-MM-DD": {1: cap, 2: cap, 3: cap}, ...}
+    # Missing date or shift key → fall back to total_crew.
+    # Only stricter-than-global caps add a constraint.
+    crew_cap_schedule: dict[str, dict[int, int]] = field(default_factory=dict)
 
     def get_day_shift_map(self, machine_id: str):
         """Return per-day shift map for a machine, or int fallback."""

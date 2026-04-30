@@ -17,7 +17,11 @@ from typing import Optional
 
 from ortools.sat.python import cp_model
 
-from .calendar_utils import add_staffed_hours, datetime_to_staffed_minute
+from .calendar_utils import (
+    add_staffed_hours,
+    datetime_to_staffed_minute,
+    iter_shift_windows_staffed_minutes,
+)
 from .models import MACHINE_BY_ID
 from .scheduler_io import SchedulerConfig
 
@@ -421,6 +425,23 @@ def solve_schedule(
 
     horizon = max(max_machine_load, serialized_bound) + total_co + 480
 
+    # If a per-day crew cap schedule is set, extend horizon to cover
+    # the latest date in the schedule plus a buffer. Otherwise tight
+    # caps near the start can render the model infeasible just because
+    # the horizon doesn't reach into the looser/fallback days.
+    if cfg.crew_cap_schedule:
+        try:
+            latest = max(
+                datetime.fromisoformat(d).replace(hour=23, minute=59)
+                for d in cfg.crew_cap_schedule.keys()
+            )
+            sched_minutes = datetime_to_staffed_minute(
+                latest, cfg.schedule_start, 2
+            )
+            horizon = max(horizon, sched_minutes + 480 * 3)
+        except (ValueError, TypeError):
+            pass
+
     # ── Variables ────────────────────────────────────────────────
 
     starts: dict[int, cp_model.IntVar] = {}
@@ -763,16 +784,122 @@ def solve_schedule(
     all_demands = [1] * len(batches)
     model.add_cumulative(all_intervals, all_demands, max_concurrent)
 
-    # ── Crew headcount capacity (cumulative) ────────────────────
-    # Prevents the solver from scheduling more total headcount
-    # than the available workforce across concurrent batches.
+    # ── Crew headcount capacity ─────────────────────────────────
+    # Two layers:
+    #   1. Global cumulative across all batches with cap = total_crew.
+    #   2. Per-window projection for shift windows whose per-day-per-
+    #      shift cap is STRICTER than the global cap. Each strict
+    #      window gets its batches projected via clipped optional
+    #      intervals; one cumulative per group of windows sharing a
+    #      cap value.
+    # Resolution per (date, shift): crew_cap_schedule[date][shift] →
+    #   total_crew. 0 / missing → use total_crew. Looser per-window
+    #   caps are skipped since the global already enforces tighter.
+    # Changeovers excluded: only batch run-time consumes the cap.
 
+    # Per-batch demand for crew cumulative: use MAX headcount across
+    # jobs in the batch (not the time-weighted dominant) so that the
+    # cap holds even at moments when the highest-HC job is running.
+    # Falls back to ceil(dominant_headcount) when job HC values are
+    # missing.
+    def _batch_peak_hc(b: ToolBatch) -> int:
+        max_hc = 0.0
+        for j in b.jobs:
+            v = j.get("headcount")
+            if v is None:
+                continue
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                continue
+            if v > max_hc:
+                max_hc = v
+        if max_hc <= 0:
+            max_hc = b.dominant_headcount
+        return max(1, int(math.ceil(max_hc)))
+
+    hc_demand_for: dict[int, int] = {
+        b.batch_id: _batch_peak_hc(b)
+        for b in batches
+    }
+
+    # Layer 1: global cumulative
     if cfg.total_crew > 0:
-        # Use ceiling rather than round: a fractional 11.4 headcount
-        # demand still occupies 12 people on the floor, and rounding
-        # down can cause the solver to over-schedule concurrent crew.
-        hc_demands = [max(1, int(math.ceil(b.dominant_headcount))) for b in batches]
+        hc_demands = [hc_demand_for[b.batch_id] for b in batches]
         model.add_cumulative(all_intervals, hc_demands, cfg.total_crew)
+
+    # Layer 2: per-window projection for strict-than-global windows
+    schedule_caps = cfg.crew_cap_schedule or {}
+    if schedule_caps:
+        if cfg.shifts_per_day:
+            global_shifts = max(cfg.shifts_per_day.values())
+        else:
+            global_shifts = 2
+        global_shifts = max(1, min(3, global_shifts))
+
+        all_windows = iter_shift_windows_staffed_minutes(
+            cfg.schedule_start, horizon, global_shifts
+        )
+
+        # Group strict windows by cap value (one cumulative per cap)
+        strict_by_cap: dict[int, list[tuple[int, int]]] = {}
+        for shift_id, date_iso, w_start, w_end in all_windows:
+            if w_end <= w_start:
+                continue
+            day = schedule_caps.get(date_iso) or {}
+            # Schedule keys may be int or str depending on JSON parse path
+            cap_raw = day.get(shift_id, day.get(str(shift_id)))
+            if cap_raw is None:
+                continue
+            try:
+                cap = int(cap_raw)
+            except (TypeError, ValueError):
+                continue
+            if cap <= 0:
+                continue  # 0 = fall back to global
+            if cfg.total_crew > 0 and cap >= cfg.total_crew:
+                continue  # global already enforces tighter
+            strict_by_cap.setdefault(cap, []).append((w_start, w_end))
+
+        for cap, wins in strict_by_cap.items():
+            clip_intervals: list[cp_model.IntervalVar] = []
+            clip_demands: list[int] = []
+
+            for b in batches:
+                if b.total_minutes <= 0:
+                    continue
+                bs = starts[b.batch_id]
+                be = ends[b.batch_id]
+                demand = hc_demand_for[b.batch_id]
+
+                for w_start, w_end in wins:
+                    if w_start >= horizon:
+                        continue
+
+                    tag = f"c{cap}_b{b.batch_id}_w{w_start}"
+                    cs = model.new_int_var(0, horizon, f"hc_cs_{tag}")
+                    model.add_max_equality(cs, [bs, w_start])
+
+                    ce = model.new_int_var(0, horizon, f"hc_ce_{tag}")
+                    model.add_min_equality(ce, [be, w_end])
+
+                    raw_diff = model.new_int_var(-horizon, horizon, f"hc_d_{tag}")
+                    model.add(raw_diff == ce - cs)
+                    overlap = model.new_int_var(0, horizon, f"hc_o_{tag}")
+                    model.add_max_equality(overlap, [raw_diff, 0])
+
+                    present = model.new_bool_var(f"hc_p_{tag}")
+                    model.add(overlap >= 1).only_enforce_if(present)
+                    model.add(overlap == 0).only_enforce_if(~present)
+
+                    clip = model.new_optional_interval_var(
+                        cs, overlap, ce, present, f"hc_iv_{tag}"
+                    )
+                    clip_intervals.append(clip)
+                    clip_demands.append(demand)
+
+            if clip_intervals:
+                model.add_cumulative(clip_intervals, clip_demands, cap)
 
     # ── Crew jump ±2 tool-distance HARD constraint ───────────────
     #
