@@ -31,7 +31,7 @@ model scheduler_yellow_pink_jobs {
   so_number           String    @db.NVarChar(50)
   part_number         String?   @db.NVarChar(100)
   description         String?   @db.NVarChar(500)
-  tool_id             String?   @db.NVarChar(50)
+  tool_id             String?   @db.NVarChar(200)
   machine             String?   @db.NVarChar(20)
   due_date            DateTime? @db.Date
   scheduled_start     DateTime? @db.DateTime2
@@ -50,7 +50,7 @@ model scheduler_germantown_jobs {
   finished_item       String?   @db.NVarChar(100)
   description         String?   @db.NVarChar(500)
   customer            String?   @db.NVarChar(255)
-  tool_id             String?   @db.NVarChar(50)
+  tool_id             String?   @db.NVarChar(200)
   eqp_code            String?   @db.NVarChar(50)
   remaining_qty       Decimal?  @db.Decimal(12, 2)
   run_hours           Decimal?  @db.Decimal(8, 2)
@@ -73,7 +73,7 @@ model scheduler_published_schedule {
   end_time            DateTime  @db.DateTime2
   shift               Int?      @db.SmallInt
   machine_group       String?   @db.NVarChar(50)
-  tool_id             String?   @db.NVarChar(50)
+  tool_id             String?   @db.NVarChar(200)
   so_number           String?   @db.NVarChar(50)
   finished_item       String?   @db.NVarChar(100)
   description         String?   @db.NVarChar(500)
