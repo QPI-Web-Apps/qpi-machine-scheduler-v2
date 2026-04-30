@@ -657,12 +657,32 @@ def _apply_assignments(
     freed_events: list[tuple],
     job_starts: list[ScheduleEntry],
 ) -> list[CrewMovement]:
-    """Convert an assignment vector to CrewMovement list and annotate entries."""
+    """Convert an assignment vector to CrewMovement list and annotate entries.
+
+    Unassigned freed events (no in-shift recipient) are emitted as
+    CREW_POOL returns so they are visible in the crew movements log
+    instead of disappearing silently.
+    """
     movements: list[CrewMovement] = []
     for i, target_idx in enumerate(assignments):
-        if target_idx < 0:
-            continue
         freed_time, freed_machine, hc, reason, source_entry = freed_events[i]
+        if freed_machine == "CREW_POOL":
+            # This freed_event is itself a shift-start pool draw, not a
+            # release back to pool. Skip if unassigned (handled elsewhere).
+            if target_idx < 0:
+                continue
+        if target_idx < 0:
+            # Crew freed but no matching recipient → returns to pool.
+            if source_entry is not None:
+                source_entry.crew_to = "CREW_POOL"
+            movements.append(CrewMovement(
+                time=freed_time,
+                from_machine=freed_machine,
+                to_machine="CREW_POOL",
+                headcount=hc,
+                reason=f"{reason}_to_pool",
+            ))
+            continue
         target = job_starts[target_idx]
 
         if source_entry:
